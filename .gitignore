@@ -1,0 +1,8 @@
+# ROS2 colcon 构建产物
+ros2/build/
+ros2/install/
+ros2/log/
+
+# 集成方本地编译产物
+*.o
+*.out

@@ -1,0 +1,25 @@
+sdk_bridge_node:
+  ros__parameters:
+    # 设备连接
+    device_ip: "192.168.123.103"
+    device_port: 7448          # modeling_app 端口（1.0.0 起，SDK 只连此单端点）
+    connect_timeout_ms: 5000
+
+    # 坐标系名称（map → base_link 两层；base_link 即设备 IMU 系）
+    map_frame: "map"
+    base_frame: "base_link"
+
+    # 话题名称
+    odom_topic: "/lixel/odom"
+    tf_topic: "/lixel/tf"
+    cloud_topic: "/lixel/cloud_points"
+    imu_topic: "/lixel/imu"
+    raw_cloud_topic: "/lixel/raw_cloud"
+    image_left_topic: "/lixel/camera/left/compressed"
+    image_center_topic: "/lixel/camera/center/compressed"
+    image_right_topic: "/lixel/camera/right/compressed"
+    diagnostics_topic: "/lixel/diagnostics"
+
+    # 说明：SDK 订阅 device_locate/reloc_device_cloud，位姿/点云本身即设备（IMU）系，
+    # base_link 直接等于设备 IMU 基准，桥接不做任何外参变换。
+    # 载体（狗/车等）到设备的安装变换，由集成方在 base_link 之下自行发布 TF。

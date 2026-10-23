@@ -1,6 +1,6 @@
 /******************************************************************************
 This file is part of XGRIDS Robot SDK.
-Project: lixel_sdk_ros2
+Project: lixel_ros
 Author : XGRIDS Embedded Software Team
 *******************************************************************************
 History:
@@ -13,23 +13,19 @@ History:
  *
  * 功能：
  *   - 通过 lixel_sdk 连接设备并订阅位姿/点云/IMU/图像/错误码数据
- *   - 将位姿数据转换为 nav_msgs/Odometry 发布到 /lixel/odom（map → base_link）
- *   - 同时发布 tf2_msgs/TFMessage 到 /lixel/tf（map → base_link 动态 TF）
- *   - base_link 即设备（IMU）系，SDK 订阅 device_locate/reloc_device_cloud，
- *     位姿/点云本身即设备系，桥接不做外参变换；载体变换由集成方自行叠加
- *   - 将点云数据转换为 sensor_msgs/PointCloud2 发布到 /lixel/cloud_points
+ *   - 将设备位姿发布为 map → imu_link 的里程计与动态 TF（SDK 测的是设备/IMU 位姿）
+ *   - 发布 imu_link → base_link 的静态 TF（参数即发布方向，不做取逆）
  *   - 将 IMU 数据转换为 sensor_msgs/Imu 发布到 /lixel/imu
- *   - 将原始点云转换为 sensor_msgs/PointCloud2 发布到 /lixel/raw_cloud
+ *   - 将设备系 Locate 去畸变点云（key device_undist_cloud）转换为
+ *     sensor_msgs/PointCloud2 发布到 /lixel/device_undist_cloud
  *   - 将 JPEG 图像转换为 sensor_msgs/CompressedImage 发布到 /lixel/camera/xxx
  *   - 将错误码转换为 diagnostic_msgs/DiagnosticArray 发布到 /lixel/diagnostics
  */
 
-#include <chrono>
+#include <cmath>
 #include <cstring>
 #include <memory>
 #include <string>
-#include <thread>
-#include <vector>
 
 #include <rclcpp/rclcpp.hpp>
 #include <nav_msgs/msg/odometry.hpp>
@@ -39,9 +35,12 @@ History:
 #include <sensor_msgs/msg/compressed_image.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <tf2_msgs/msg/tf_message.hpp>
+#include <tf2_ros/static_transform_broadcaster.h>
+#include <tf2/LinearMath/Transform.h>
 #include <diagnostic_msgs/msg/diagnostic_array.hpp>
 #include <diagnostic_msgs/msg/diagnostic_status.hpp>
 #include <diagnostic_msgs/msg/key_value.hpp>
+
 
 #include "xg/robot_sdk.h"
 
@@ -50,19 +49,36 @@ public:
     SdkBridgeNode() : Node("sdk_bridge_node") {
         // 声明参数
         declare_parameter("device_ip", "192.168.123.103");
+        // 默认值与 config/default_params.yaml 一致（以 yaml 为准）。SDK 1.0.0 的
+        // modeling_app 在 7448，7447 是 0.3.x 的旧端口，见 yaml 注释。
         declare_parameter("device_port", 7448);
         declare_parameter("connect_timeout_ms", 5000);
-        // 世界系默认 map：设备输出为 SLAM/重定位全局位姿（含重定位，绑地图），
-        // 语义上是 map 而非 odom（参见 coordinate_frames.md 与 ROS REP-105）。
-        declare_parameter("map_frame", "map");
-        // base_link 直接等于设备（IMU）系：SDK 订阅 device_locate/reloc_device_cloud，
-        // 拿到的位姿/点云本身就是设备 IMU 基准，桥接不再做任何外参变换。
+        declare_parameter("odom_frame", "map");
         declare_parameter("base_frame", "base_link");
-        declare_parameter("odom_topic", "/lixel/odom");
-        declare_parameter("tf_topic", "/lixel/tf");
-        declare_parameter("cloud_topic", "/lixel/cloud_points");
+        declare_parameter("sensor_frame", "sensor_link");
+        declare_parameter("lidar_frame", "imu_link");
+        // imu_link -> base_link 的静态外参（IMU 坐标系 -> ODOM 坐标系），就是本节点
+        // 原样发布的那条 TF。参数方向与发布方向一致，节点不做任何取逆或取反，
+        // 含义是"base_link 在 imu_link 中的位姿"。
+        //
+        // 以 config/default_params.yaml 为准，这里的默认值只在没加载 yaml 时
+        // 生效，与 yaml 保持一致：
+        //   旋转：固定的轴系重定义，手持扫描仪时 base X 朝前。
+        //         base X = IMU -z,  base Y = IMU +x,  base Z = IMU -y
+        //   平移：0，ODOM 原点就在扫描仪原点（IMU 点）。平移按 IMU 轴向填，
+        //         换算方法见 yaml 注释和 README。
+        declare_parameter("lidar_to_base_x", 0.0);
+        declare_parameter("lidar_to_base_y", 0.0);
+        declare_parameter("lidar_to_base_z", 0.0);
+        declare_parameter("lidar_to_base_qx", 0.5);
+        declare_parameter("lidar_to_base_qy", 0.5);
+        declare_parameter("lidar_to_base_qz", -0.5);
+        declare_parameter("lidar_to_base_qw", 0.5);
+        declare_parameter("odom_topic", "/odom");
+        declare_parameter("tf_topic", "/tf");
         declare_parameter("imu_topic", "/lixel/imu");
-        declare_parameter("raw_cloud_topic", "/lixel/raw_cloud");
+        declare_parameter("device_undist_cloud_topic",
+                          "/lixel/device_undist_cloud");
         declare_parameter("image_left_topic", "/lixel/camera/left/compressed");
         declare_parameter("image_center_topic", "/lixel/camera/center/compressed");
         declare_parameter("image_right_topic", "/lixel/camera/right/compressed");
@@ -72,15 +88,28 @@ public:
         std::string deviceIp = get_parameter("device_ip").as_string();
         int devicePort = get_parameter("device_port").as_int();
         int connectTimeoutMs = get_parameter("connect_timeout_ms").as_int();
-        mapFrame_ = get_parameter("map_frame").as_string();
+        odomFrame_ = get_parameter("odom_frame").as_string();
         baseFrame_ = get_parameter("base_frame").as_string();
-
+        sensorFrame_ = get_parameter("sensor_frame").as_string();
+        imuFrame_ = get_parameter("lidar_frame").as_string();
+        const double i2bX = get_parameter("lidar_to_base_x").as_double();
+        const double i2bY = get_parameter("lidar_to_base_y").as_double();
+        const double i2bZ = get_parameter("lidar_to_base_z").as_double();
+        const double i2bQx = get_parameter("lidar_to_base_qx").as_double();
+        const double i2bQy = get_parameter("lidar_to_base_qy").as_double();
+        const double i2bQz = get_parameter("lidar_to_base_qz").as_double();
+        const double i2bQw = get_parameter("lidar_to_base_qw").as_double();
+        // 缓存 imu_link -> base_link，onPose 要用它把设备位姿复合成
+        // base_link 位姿。构造 tf2::Quaternion 的参数顺序是 (x, y, z, w)。
+        tfImuBase_ = tf2::Transform(
+            tf2::Quaternion(i2bQx, i2bQy, i2bQz, i2bQw),
+            tf2::Vector3(i2bX, i2bY, i2bZ));
         // 创建 Publisher
         std::string odomTopic = get_parameter("odom_topic").as_string();
         std::string tfTopic = get_parameter("tf_topic").as_string();
-        std::string cloudTopic = get_parameter("cloud_topic").as_string();
         std::string imuTopic = get_parameter("imu_topic").as_string();
-        std::string rawCloudTopic = get_parameter("raw_cloud_topic").as_string();
+        std::string undistCloudTopic =
+            get_parameter("device_undist_cloud_topic").as_string();
         std::string imageLeftTopic = get_parameter("image_left_topic").as_string();
         std::string imageCenterTopic = get_parameter("image_center_topic").as_string();
         std::string imageRightTopic = get_parameter("image_right_topic").as_string();
@@ -88,13 +117,47 @@ public:
 
         odomPub_ = create_publisher<nav_msgs::msg::Odometry>(odomTopic, 10);
         tfPub_ = create_publisher<tf2_msgs::msg::TFMessage>(tfTopic, 10);
-        cloudPub_ = create_publisher<sensor_msgs::msg::PointCloud2>(cloudTopic, 10);
         imuPub_ = create_publisher<sensor_msgs::msg::Imu>(imuTopic, 50);
-        rawCloudPub_ = create_publisher<sensor_msgs::msg::PointCloud2>(rawCloudTopic, 10);
+        undistCloudPub_ =
+            create_publisher<sensor_msgs::msg::PointCloud2>(undistCloudTopic, 10);
         imageLeftPub_ = create_publisher<sensor_msgs::msg::CompressedImage>(imageLeftTopic, 5);
         imageCenterPub_ = create_publisher<sensor_msgs::msg::CompressedImage>(imageCenterTopic, 5);
         imageRightPub_ = create_publisher<sensor_msgs::msg::CompressedImage>(imageRightTopic, 5);
         diagPub_ = create_publisher<diagnostic_msgs::msg::DiagnosticArray>(diagTopic, 10);
+
+        // imu_link -> base_link：参数即发布内容，方向一致，不做任何换算。
+        // 用 StaticTransformBroadcaster 而不是自己发 /tf_static，是为了拿到正确的
+        // transient_local QoS —— 后启动的节点才能收到这条只发一次的变换。
+        staticTfBroadcaster_ =
+            std::make_shared<tf2_ros::StaticTransformBroadcaster>(this);
+        geometry_msgs::msg::TransformStamped mount;
+        mount.header.stamp = now();
+        mount.header.frame_id = imuFrame_;
+        mount.child_frame_id = baseFrame_;
+        mount.transform.translation.x = i2bX;
+        mount.transform.translation.y = i2bY;
+        mount.transform.translation.z = i2bZ;
+        mount.transform.rotation.x = i2bQx;
+        mount.transform.rotation.y = i2bQy;
+        mount.transform.rotation.z = i2bQz;
+        mount.transform.rotation.w = i2bQw;
+
+        // 非单位四元数会让下游 TF 静默算错，宁可启动时就报出来。
+        const double qn = std::sqrt(i2bQx * i2bQx + i2bQy * i2bQy +
+                                    i2bQz * i2bQz + i2bQw * i2bQw);
+        if (!std::isfinite(qn) || std::abs(qn - 1.0) > 1e-3) {
+            RCLCPP_ERROR(get_logger(),
+                         "lidar_to_base 四元数模长 %.6f 偏离 1，静态 TF 会失真："
+                         "(%.6f, %.6f, %.6f, %.6f)",
+                         qn, i2bQx, i2bQy, i2bQz, i2bQw);
+        }
+
+        staticTfBroadcaster_->sendTransform(mount);
+        RCLCPP_INFO(get_logger(),
+                    "Static TF %s -> %s: t=(%.6f, %.6f, %.6f) "
+                    "q=(%.6f, %.6f, %.6f, %.6f) |q|=%.6f",
+                    imuFrame_.c_str(), baseFrame_.c_str(),
+                    i2bX, i2bY, i2bZ, i2bQx, i2bQy, i2bQz, i2bQw, qn);
 
         // 连接设备
         RCLCPP_INFO(get_logger(), "Connecting to device %s:%d ...",
@@ -108,41 +171,13 @@ public:
         xg::Error err = xg::Error::Ok;
         device_ = xg::Device::open(opts, &err);
         if (!device_) {
+            // 不在构造函数里 shutdown: 由 main 通过 connected() 判断后退出,
+            // 否则 shutdown 之后 main 仍会 spin, 进程 abort
             RCLCPP_FATAL(get_logger(), "Failed to connect: %s",
                          xg::toString(err));
-            rclcpp::shutdown();
             return;
         }
         RCLCPP_INFO(get_logger(), "Connected to device.");
-
-        // 自动启动录制
-        RCLCPP_INFO(get_logger(), "Starting record...");
-        auto startErr = device_->startRecord();
-        if (startErr != xg::Error::Ok) {
-            RCLCPP_WARN(get_logger(), "Start record failed: %s (device may already be recording)",
-                        xg::toString(startErr));
-        }
-
-        // 等待进入录制状态
-        RCLCPP_INFO(get_logger(), "Waiting for recording state...");
-        xg::RecordStatus recStatus;
-        for (int i = 0; i < 60; ++i) {  // 最多等 30 秒
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-            if (device_->queryRecordStatus(&recStatus) != xg::Error::Ok) {
-                continue;
-            }
-            if (recStatus.state == xg::RecordState::Recording) {
-                RCLCPP_INFO(get_logger(), "Device is now recording.");
-                break;
-            }
-            if (recStatus.state == xg::RecordState::Error) {
-                RCLCPP_ERROR(get_logger(), "Device error: %s", recStatus.message.c_str());
-                break;
-            }
-            if (i % 4 == 0) {
-                RCLCPP_INFO(get_logger(), "  state: %s, waiting...", xg::toString(recStatus.state));
-            }
-        }
 
         // 订阅位姿
         auto poseErr = device_->subscribePose(
@@ -152,16 +187,6 @@ public:
                          xg::toString(poseErr));
         } else {
             RCLCPP_INFO(get_logger(), "Pose subscription active (~100Hz).");
-        }
-
-        // 订阅点云
-        auto cloudErr = device_->subscribeCloud(
-            [this](const xg::CloudFrame& frame) { onCloud(frame); });
-        if (cloudErr != xg::Error::Ok) {
-            RCLCPP_ERROR(get_logger(), "Failed to subscribe cloud: %s",
-                         xg::toString(cloudErr));
-        } else {
-            RCLCPP_INFO(get_logger(), "Cloud subscription active (~1Hz).");
         }
 
         // 订阅 IMU
@@ -174,14 +199,16 @@ public:
             RCLCPP_INFO(get_logger(), "IMU subscription active (~200Hz).");
         }
 
-        // 订阅原始点云
-        auto rawCloudErr = device_->subscribeRawCloud(
-            [this](const xg::CloudFrame& frame) { onRawCloud(frame); });
-        if (rawCloudErr != xg::Error::Ok) {
-            RCLCPP_ERROR(get_logger(), "Failed to subscribe raw cloud: %s",
-                         xg::toString(rawCloudErr));
+        // 订阅设备(IMU)系 Locate 去畸变点云（建图阶段该 key 无数据）
+        auto undistCloudErr = device_->subscribeDeviceUndistCloud(
+            [this](const xg::CloudFrame& frame) { onDeviceUndistCloud(frame); });
+        if (undistCloudErr != xg::Error::Ok) {
+            RCLCPP_ERROR(get_logger(),
+                         "Failed to subscribe device undist cloud: %s!",
+                         xg::toString(undistCloudErr));
         } else {
-            RCLCPP_INFO(get_logger(), "Raw cloud subscription active (~10Hz).");
+            RCLCPP_INFO(get_logger(),
+                        "Device undist cloud subscription active (~10Hz).");
         }
 
         // 订阅图像（三路相机）
@@ -200,7 +227,7 @@ public:
         if (imgRightErr != xg::Error::Ok) {
             RCLCPP_WARN(get_logger(), "Failed to subscribe right camera.");
         }
-        RCLCPP_INFO(get_logger(), "Image subscriptions active (~2fps).");
+        RCLCPP_INFO(get_logger(), "Image subscriptions active (rate set by device jpeg.fps).");
 
         // 订阅错误码
         auto errCodeErr = device_->subscribeErrCode(
@@ -211,109 +238,90 @@ public:
             RCLCPP_INFO(get_logger(), "Error code subscription active (~10Hz).");
         }
 
-        RCLCPP_INFO(get_logger(), "SDK Bridge Node ready (v0.3.1).");
+        RCLCPP_INFO(get_logger(), "SDK Bridge Node ready (SDK %s).",
+                    xg::sdkVersion().c_str());
     }
 
     ~SdkBridgeNode() override {
-        if (device_) {
-            device_->stopRecord();
-            RCLCPP_INFO(get_logger(), "Record stopped.");
-        }
         device_.reset();
         RCLCPP_INFO(get_logger(), "Device disconnected.");
     }
 
+    /// 是否已连上设备（连接失败时构造函数提前返回, 节点未完成初始化）
+    bool connected() const { return device_ != nullptr; }
+
 private:
     // ==================== 位姿回调 ====================
-    // 设备（IMU）系位姿直接作为 map → base_link，不做任何外参变换。
-    // base_link 即设备 IMU 基准；载体（狗/车等）到设备的变换由集成方自行叠加。
     void onPose(const xg::Pose& pose) {
+        const auto stamp = this->now();
+
+        // SDK 报的是设备（IMU/雷达）位姿，即 map -> imu_link。
+        const tf2::Transform tMapImu(
+            tf2::Quaternion(pose.quatX, pose.quatY, pose.quatZ, pose.quatW),
+            tf2::Vector3(pose.posX, pose.posY, pose.posZ));
+
+        // /odom 声明 map -> base_link，就必须给出 base_link 的位姿。
+        // 只改 child_frame_id 而照发设备位姿，等于给雷达位姿贴上 base_link
+        // 的标签，下游会按错误的原点做规划。
+        const tf2::Transform tMapBase = tMapImu * tfImuBase_;
+
         auto odom = nav_msgs::msg::Odometry();
-        fillTimestamp(odom.header.stamp, pose.timestampSec);
-        odom.header.frame_id = mapFrame_;
+        odom.header.stamp = stamp;
+        odom.header.frame_id = odomFrame_;
         odom.child_frame_id = baseFrame_;
 
-        odom.pose.pose.position.x = pose.posX;
-        odom.pose.pose.position.y = pose.posY;
-        odom.pose.pose.position.z = pose.posZ;
-        odom.pose.pose.orientation.w = pose.quatW;
-        odom.pose.pose.orientation.x = pose.quatX;
-        odom.pose.pose.orientation.y = pose.quatY;
-        odom.pose.pose.orientation.z = pose.quatZ;
-        odom.twist.twist.linear.x = pose.velX;
-        odom.twist.twist.linear.y = pose.velY;
-        odom.twist.twist.linear.z = pose.velZ;
-        odom.twist.twist.angular.x = pose.gyroX;
-        odom.twist.twist.angular.y = pose.gyroY;
-        odom.twist.twist.angular.z = pose.gyroZ;
+        const tf2::Vector3& pBase = tMapBase.getOrigin();
+        odom.pose.pose.position.x = pBase.x();
+        odom.pose.pose.position.y = pBase.y();
+        odom.pose.pose.position.z = pBase.z();
+        const tf2::Quaternion qBase = tMapBase.getRotation();
+        odom.pose.pose.orientation.x = qBase.x();
+        odom.pose.pose.orientation.y = qBase.y();
+        odom.pose.pose.orientation.z = qBase.z();
+        odom.pose.pose.orientation.w = qBase.w();
 
-        // 发布 /odom（map → base_link）
+        // twist 按 ROS 约定在 child_frame_id（base_link）系表达。设备给的
+        // vel/gyro 在设备系，描述的是雷达那一点；base_link 是同一刚体上的另一
+        // 点，线速度必须补 ω × r 这一项 —— 如 A2 安装外参平移 0.344 m，1 rad/s 偏航就会
+        // 带来 0.34 m/s 的误差，不是可以忽略的量级。
+        const tf2::Vector3 vImu(pose.velX, pose.velY, pose.velZ);
+        const tf2::Vector3 wImu(pose.gyroX, pose.gyroY, pose.gyroZ);
+        const tf2::Matrix3x3 rBaseImu(tfImuBase_.getRotation().inverse());
+        const tf2::Vector3 vBase =
+            rBaseImu * (vImu + wImu.cross(tfImuBase_.getOrigin()));
+        const tf2::Vector3 wBase = rBaseImu * wImu;
+        odom.twist.twist.linear.x = vBase.x();
+        odom.twist.twist.linear.y = vBase.y();
+        odom.twist.twist.linear.z = vBase.z();
+        odom.twist.twist.angular.x = wBase.x();
+        odom.twist.twist.angular.y = wBase.y();
+        odom.twist.twist.angular.z = wBase.z();
         odomPub_->publish(odom);
 
-        // 发布动态 /tf（map → base_link），值与 /odom 一致
+        // 动态 TF 仍发 map -> imu_link，用 SDK 原值；与静态 TF
+        // imu_link -> base_link 串起来就是完整的 map -> base_link。
+        // 这样安装外参只在静态 TF 一处生效，不会被写进两个地方各算一遍。
         auto tfMsg = tf2_msgs::msg::TFMessage();
         geometry_msgs::msg::TransformStamped tf;
-        tf.header.stamp = odom.header.stamp;
-        tf.header.frame_id = mapFrame_;
-        tf.child_frame_id = baseFrame_;
-        tf.transform.translation.x = odom.pose.pose.position.x;
-        tf.transform.translation.y = odom.pose.pose.position.y;
-        tf.transform.translation.z = odom.pose.pose.position.z;
-        tf.transform.rotation = odom.pose.pose.orientation;
+        tf.header.stamp = stamp;
+        tf.header.frame_id = odomFrame_;
+        tf.child_frame_id = imuFrame_;
+        tf.transform.translation.x = pose.posX;
+        tf.transform.translation.y = pose.posY;
+        tf.transform.translation.z = pose.posZ;
+        tf.transform.rotation.w = pose.quatW;
+        tf.transform.rotation.x = pose.quatX;
+        tf.transform.rotation.y = pose.quatY;
+        tf.transform.rotation.z = pose.quatZ;
         tfMsg.transforms.push_back(tf);
         tfPub_->publish(tfMsg);
     }
-
     // ==================== 点云回调 ====================
-    // reloc 点云来自 device_locate 对应的 reloc_device_cloud（设备/IMU 系），
-    // 直接标 base_link，无需外参变换。
-    void onCloud(const xg::CloudFrame& frame) {
-        auto msg = sensor_msgs::msg::PointCloud2();
-        fillTimestamp(msg.header.stamp, frame.timestampSec);
-        msg.header.frame_id = baseFrame_;
-
-        // PointCloud2 格式描述
-        msg.height = 1;
-        msg.width = static_cast<uint32_t>(frame.count);
-        msg.is_dense = true;
-        msg.is_bigendian = false;
-        msg.point_step = 16;  // 4 floats × 4 bytes
-        msg.row_step = msg.point_step * msg.width;
-
-        // 字段定义: x, y, z, intensity
-        sensor_msgs::msg::PointField field;
-        field.datatype = sensor_msgs::msg::PointField::FLOAT32;
-        field.count = 1;
-
-        field.name = "x";
-        field.offset = 0;
-        msg.fields.push_back(field);
-        field.name = "y";
-        field.offset = 4;
-        msg.fields.push_back(field);
-        field.name = "z";
-        field.offset = 8;
-        msg.fields.push_back(field);
-        field.name = "intensity";
-        field.offset = 12;
-        msg.fields.push_back(field);
-
-        // 数据拷贝（xg_point_t 内存布局与 PointCloud2 XYZI 一致）
-        msg.data.resize(msg.row_step);
-        if (frame.count > 0 && frame.points != nullptr) {
-            std::memcpy(msg.data.data(), frame.points,
-                        frame.count * sizeof(xg_point_t));
-        }
-
-        // Task 14.2: 发布 /cloud_points
-        cloudPub_->publish(msg);
-    }
-
     // ==================== IMU 回调 ====================
     void onImu(const xg::Device::Imu& imu) {
         auto msg = sensor_msgs::msg::Imu();
-        fillTimestamp(msg.header.stamp, imu.timestampSec);
-        msg.header.frame_id = baseFrame_;
+        msg.header.stamp = this->now();
+        msg.header.frame_id = sensorFrame_;
 
         msg.linear_acceleration.x = imu.accX;
         msg.linear_acceleration.y = imu.accY;
@@ -328,11 +336,13 @@ private:
         imuPub_->publish(msg);
     }
 
-    // ==================== 原始点云回调 ====================
-    void onRawCloud(const xg::CloudFrame& frame) {
+    // ==================== 去畸变点云回调 ====================
+    // 来自 device_undist_cloud（Locate 去畸变点云），坐标系是设备（IMU）系，
+    // 标 imu_link（lidar_frame 参数），经静态 TF 与 base_link 相连。
+    void onDeviceUndistCloud(const xg::CloudFrame& frame) {
         auto msg = sensor_msgs::msg::PointCloud2();
-        fillTimestamp(msg.header.stamp, frame.timestampSec);
-        msg.header.frame_id = baseFrame_;
+        msg.header.stamp = this->now();
+        msg.header.frame_id = imuFrame_;
 
         msg.height = 1;
         msg.width = static_cast<uint32_t>(frame.count);
@@ -364,14 +374,14 @@ private:
                         frame.count * sizeof(xg_point_t));
         }
 
-        rawCloudPub_->publish(msg);
+        undistCloudPub_->publish(msg);
     }
 
     // ==================== 图像回调 ====================
     void onImage(const xg::Device::ImageFrame& frame) {
         auto msg = sensor_msgs::msg::CompressedImage();
-        fillTimestamp(msg.header.stamp, frame.timestampSec);
-        msg.header.frame_id = baseFrame_;
+        msg.header.stamp = this->now();
+        msg.header.frame_id = sensorFrame_;
         msg.format = "jpeg";
 
         if (frame.jpegData != nullptr && frame.jpegSize > 0) {
@@ -428,13 +438,11 @@ private:
         diagPub_->publish(msg);
     }
 
-    // ==================== 工具函数 ====================
-    static void fillTimestamp(builtin_interfaces::msg::Time& stamp,
-                              double sec) {
-        int64_t nsec = static_cast<int64_t>(sec * 1e9);
-        stamp.sec = static_cast<int32_t>(nsec / 1000000000LL);
-        stamp.nanosec = static_cast<uint32_t>(nsec % 1000000000LL);
-    }
+    // 所有话题统一用 ROS 时钟（this->now()），不再使用设备时间戳。
+    // 实测设备墙钟与机器人系统时间相差约 1016 天（设备 2023-11-29，
+    // 机器人 2026-09-10），两者混用会让下游按消息时间查 TF 时差出数年。
+    // 原先把设备 timestampSec 转成 ROS Time 的 fillTimestamp 已无调用者，
+    // 一并移除，避免留下死代码被误用。
 
 private:
     // SDK 设备句柄
@@ -443,22 +451,32 @@ private:
     // ROS2 Publishers
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odomPub_;
     rclcpp::Publisher<tf2_msgs::msg::TFMessage>::SharedPtr tfPub_;
-    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr cloudPub_;
+    std::shared_ptr<tf2_ros::StaticTransformBroadcaster> staticTfBroadcaster_;
+
+    // imu_link -> base_link 的安装外参，构造时从参数缓存，onPose 每帧复用
+    tf2::Transform tfImuBase_{tf2::Transform::getIdentity()};
     rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr imuPub_;
-    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr rawCloudPub_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr undistCloudPub_;
     rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr imageLeftPub_;
     rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr imageCenterPub_;
     rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr imageRightPub_;
     rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr diagPub_;
 
-    // 坐标系参数：map → base_link 两层，base_link 即设备（IMU）系
-    std::string mapFrame_;
+    // 坐标系参数
+    std::string odomFrame_;
     std::string baseFrame_;
+    std::string sensorFrame_;
+    std::string imuFrame_;
 };
 
 int main(int argc, char** argv) {
     rclcpp::init(argc, argv);
     auto node = std::make_shared<SdkBridgeNode>();
+    if (!node->connected()) {
+        // 连接失败: 已在构造函数里打印原因, 直接退出, 不进入 spin
+        rclcpp::shutdown();
+        return 1;
+    }
     rclcpp::spin(node);
     rclcpp::shutdown();
     return 0;

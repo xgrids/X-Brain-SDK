@@ -1,6 +1,6 @@
 # lixel_sdk 快速启动
 
-**适用版本：** 1.0.0　　**面向：** 首次拿到设备、想尽快跑通数据的集成开发者
+**适用版本：** 1.1.0　　**面向：** 首次拿到设备、想尽快跑通数据的集成开发者
 
 本文指导你从零跑通 XGRIDS 设备的数据订阅与录制控制，提供两条路径：
 
@@ -19,7 +19,7 @@
 | glibc | x86_64 ≥ 2.34；aarch64 ≥ 2.30（`ldd --version` 查看） |
 | 网络 | 主机与设备**同一交换机直连**，设备 `modeling_app` 端口（默认 **7448**）可达 |
 | 交付物 | `include/`（头文件）、`lib/liblixel_sdk.so`、`examples/`、`ros2/` |
-| ROS2（仅路径 B） | Humble（Ubuntu 22.04）或 Foxy（Ubuntu 20.04），需 Eigen3 |
+| ROS2（仅路径 B） | Humble（Ubuntu 22.04），另需 CycloneDDS、cv_bridge、python3-opencv，见 `ros2/README.md` |
 
 **端口说明：** SDK **只连 `modeling_app` 一个端口**。数据面（位姿/点云/IMU/图像/错误码）与命令面（录制启停、状态/标定/初值/路径查询的 `robot_cmd`）都在 modeling_app 的同一 zenoh session。
 
@@ -37,7 +37,7 @@ nc -z <设备IP> 7448 && echo OK # modeling_app 端口可达
 ## 2. 核心概念（读数据前必须知道的三件事）
 
 1. **坐标系 = 设备（IMU）系**：SDK 输出的位姿/点云，原点在设备 IMU 点，遵循右手系（x 前 / y 左 / z 上）。载体（机器狗/车/无人机）的安装变换由你自己补一层 TF。设备只管"设备系"。
-2. **两种点云不是一回事**：`subscribeCloud` 是重定位 NDT 配准点云（~10Hz，设备系）；`subscribeRawCloud` 是去畸变的单帧雷达扫描（~10Hz，未经建图配准）。要每帧扫描用后者。
+2. **去畸变点云来自 Locate**：1.1 起 `subscribeDeviceUndistCloud`（key `device_undist_cloud`）输出 Locate 去畸变点云（设备（IMU）系），建图阶段（Locate 未输出）无数据；`subscribeDeviceRelocCloud` 已在 1.1 删除。点数取决于 Locate 输入（未验证）。回调运行在 Zenoh RX 线程，回调内禁止同步文件 IO、`join`、`startLocate`。
 3. **录制启停只下发、不等待**：`startRecord()` 返回成功仅表示命令被接受；进入 `Recording` 需轮询确认；而 `Recording` 也 **≠ 定位就绪**（重定位可能还要 1~2 分钟）。
 
 ---
@@ -114,14 +114,13 @@ while (true) {
 | 数据 | C++ 接口 | 频率 | 坐标系 | 结构体 |
 |------|----------|------|--------|--------|
 | 位姿 | `subscribePose` | ~100 Hz | 设备(IMU)系 | `Pose` |
-| reloc 点云 | `subscribeCloud` | ~10 Hz | 设备(IMU)系 | `CloudFrame` |
-| 原始点云 | `subscribeRawCloud` | ~20 Hz | 雷达系（去畸变单帧） | `CloudFrame` |
+| Locate 去畸变点云 | `subscribeDeviceUndistCloud` | 随 Locate 输出（频率未验证） | 设备(IMU)系 | `CloudFrame` |
 | 原始 IMU | `subscribeImu` | ~200 Hz | IMU 系 | `Imu` |
 | 相机图像 | `subscribeImage(CameraId, cb)` | 取决于设备配置 | 相机光学系 | `ImageFrame` |
 | 错误码 | `subscribeErrCode` | ~10 Hz 批量 | — | `ErrCodeFrame` |
 
 ```cpp
-dev->subscribeCloud([](const xg::CloudFrame& f) {
+dev->subscribeDeviceUndistCloud([](const xg::CloudFrame& f) {
     // f.points 指向 SDK 内部缓冲，仅本次回调有效！留用须拷贝：
     // std::vector<xg_point_t> saved(f.points, f.points + f.count);
     std::printf("cloud: %zu points\n", f.count);
@@ -154,41 +153,34 @@ dev->subscribeImage(xg::Device::CameraId::Left,
 ### B.1 编译
 
 ```bash
-mkdir -p ~/ros2_ws/src
-ln -sf <sdk>/ros2 ~/ros2_ws/src/lixel_sdk_ros2
-
-cd ~/ros2_ws
+cd <sdk>/ros2        # ros2/ 与 include/、lib/<arch>/ 平级
 source /opt/ros/humble/setup.bash
-colcon build --packages-select lixel_sdk_ros2
+colcon build --packages-select lixel_ros
 ```
 
 ### B.2 运行
 
+先用 SDK 完成设备侧流程（初始化、设置初始位姿、`startRecord()`，见路径 A 或 `examples/comprehensive`）。桥接节点只订阅数据，不启停录制，`Ctrl+C` 只停 ROS 节点：
+
 ```bash
-source /opt/ros/humble/setup.bash
-source ~/ros2_ws/install/setup.bash
-export LD_LIBRARY_PATH=<sdk>/lib:$LD_LIBRARY_PATH
-
-ros2 launch lixel_sdk_ros2 sdk_bridge.launch.py device_ip:=192.168.123.103
+bash <sdk>/ros2/start_lixel_ros.sh                                  # 参数来自 config/default_params.yaml
+bash <sdk>/ros2/start_lixel_ros.sh device_ip:=192.168.123.103       # 只覆盖设备 IP
 ```
-
-节点启动后自动连接设备并启动录制，进入录制状态后开始发布数据；`Ctrl+C` 退出时自动停录并断开。
 
 ### B.3 发布的 Topic
 
-| Topic | 类型 | 频率 | 说明 |
-|-------|------|------|------|
-| `/lixel/odom` | nav_msgs/Odometry | ~100Hz | 设备(IMU)系位姿，`map → base_link` |
-| `/lixel/tf` | tf2_msgs/TFMessage | ~100Hz | `map → base_link` 动态变换 |
-| `/lixel/cloud_points` | sensor_msgs/PointCloud2 | ~10Hz | 设备(IMU)系 reloc 点云 |
-| `/lixel/raw_cloud` | sensor_msgs/PointCloud2 | ~20Hz | 去畸变原始点云 |
-| `/lixel/imu` | sensor_msgs/Imu | ~200Hz | 原始 IMU |
-| `/lixel/camera/{left,center,right}/compressed` | sensor_msgs/CompressedImage | 取决于设备 | 三路相机 JPEG |
-| `/lixel/diagnostics` | diagnostic_msgs/DiagnosticArray | ~10Hz | 设备错误码 |
+| Topic | 类型 | 说明 |
+|-------|------|------|
+| `/odom` | nav_msgs/Odometry | `map → base_link`，~100Hz |
+| `/tf` | tf2_msgs/TFMessage | `map → imu_link`，~100Hz；`/tf_static` 发 `imu_link → base_link`（外参） |
+| `/lixel/device_undist_cloud` | sensor_msgs/PointCloud2 | 设备(IMU)系 Locate 去畸变点云，随 Locate 输出 |
+| `/lixel/imu` | sensor_msgs/Imu | 原始 IMU，~200Hz |
+| `/lixel/camera/{left,center,right}/compressed` | sensor_msgs/CompressedImage | 三路相机 JPEG，帧率以设备配置为准 |
+| `/lixel/diagnostics` | diagnostic_msgs/DiagnosticArray | 设备错误码 |
 
 ```bash
 ros2 topic list             # 查看话题
-ros2 topic hz /lixel/odom   # 确认位姿在发
+ros2 topic hz /odom         # 确认位姿在发
 ```
 
 ### B.4 rviz2 可视化
@@ -196,14 +188,12 @@ ros2 topic hz /lixel/odom   # 确认位姿在发
 ```bash
 rviz2
 # Fixed Frame 设为 map
-# 添加 TF / Odometry(/lixel/odom) / PointCloud2(/lixel/cloud_points)
+# 添加 TF / Odometry(/odom) / PointCloud2(/lixel/device_undist_cloud)
 ```
 
 ### B.5 TF 结构与参数
 
-TF 仅两层：`map ──(动态,~100Hz)──► base_link`。`base_link` 即设备 IMU 基准，桥接不做外参变换。若设备装在载体上，需要载体中心位姿时，由你在 `base_link` 之下再发一层静态 TF（设备 → 载体）。
-
-常用参数（改 `config/default_params.yaml` 或 `--ros-args -p key:=value`）：`device_ip`、`device_port`（默认 7448）、`connect_timeout_ms`、`map_frame`、`base_frame`。详见 `ros2/README.md`。
+TF：`map ──(动态,~100Hz)──► imu_link ──(静态,外参)──► base_link`。`base_link` 是 ROS 直出的 ODOM 坐标系，默认原点在扫描仪原点，手持时 X 朝前；装到机器人上只改平移外参。全部参数（设备连接、坐标系、外参、话题名）在 `config/default_params.yaml`，换算方法与坐标系定义见 [`ros2/README.md`](../ros2/README.md)。
 
 ---
 
@@ -226,12 +216,12 @@ TF 仅两层：`map ──(动态,~100Hz)──► base_link`。`base_link` 即�
 
 ## 4. 联调与排障
 
-自带示例（编译后在 `build-<arch>/`）：
+自带示例的预编译产物在 `bin/<arch>/<分类>/`（以下以 x86_64 为例，分类说明见 `examples/README.md`）：
 
 ```bash
-./record_demo <设备IP> [录制秒数]   # 录制启停 + 状态演变
-./subscribe_demo <设备IP>           # 数据订阅
-./all_features_demo <设备IP>        # 全功能演示
+./bin/x86_64/record/record_demo <设备IP> [录制秒数]          # 录制启停 + 状态演变
+./bin/x86_64/subscribe/subscribe_demo <设备IP> [输出目录|-] [X] [Y] [Z]   # 数据订阅，自带 setLocInitPose，X/Y/Z 为地图系初值(m)，默认 0 0 0
+./bin/x86_64/comprehensive/all_features_demo <设备IP> [订阅秒=15] [X=0] [Y=0] [Z=0]   # 全功能演示，自带 setLocInitPose，X/Y/Z 为地图系初值(m)，默认 0 0 0；默认值在本机地图上可能重定位失败，请传设备实际所在附近的坐标
 ```
 
 | 现象 | 原因 | 处理 |
@@ -240,12 +230,15 @@ TF 仅两层：`map ──(动态,~100Hz)──► base_link`。`base_link` 即�
 | 连上但所有数据 0 帧 | 设备未在录制 | 先录制并等待进入 `Recording` |
 | 位姿正常但点云为 0 | 重定位未运行 | 需加载先验地图并重定位成功 |
 | 位姿/点云坐标"不对" | 按 Body 系理解了 | 数据是**设备(IMU)系**，载体变换自己补 |
+| 图像、IMU、点云的时间戳互相对不上，或与本机时间差很多 | 各路取自不同的时钟（设备系统时钟、MCU、雷达） | 见 [api_reference_v2.md §0.8](api_reference_v2.md#08-时间戳时基与换算)；图像、深度图可用 `getDeviceTime` 换到本机时钟 |
+| `getDeviceTime` 返回 `Protocol` | 设备固件不支持时间查询（应答里没有 `time`） | 升级设备固件；`getDeviceInfo` 等其他接口不受影响 |
 | `startRecord` 返回 Timeout | 命令可能已送达 | 不要重试，先 `queryRecordStatus` |
 
 ---
 
 ## 5. 版本与兼容
 
-- `xg_sdk_version()` = `"1.0.0"`。
+- `xg_sdk_version()` = `"1.1.0"`。
+- 动态库 SONAME 为 `liblixel_sdk.so.1.1`（`<主>.<次>`两位）。补丁版本不改 SONAME，次版本改 SONAME 须重新链接；1.0.0 的 SONAME 是 `liblixel_sdk.so.1`，用 1.0.0 编译的程序须重新编译，详见 [releases/v1.1.0.md](releases/v1.1.0.md)。
 - 位姿/点云为设备(IMU)系；`Options.port` 直接指定 modeling_app 端口（默认 7448），SDK 只连一个端点。
 - `Pose.isLocal` 为**保留字段**（恒为 0），勿使用。

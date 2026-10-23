@@ -3,14 +3,14 @@
 用于远程控制 XGRIDS 设备录制并订阅实时数据的 C++ SDK。
 
 - 语言：C++11 及以上（C++17 推荐）
-- 版本：1.0.0
+- 版本：1.1.0
 
 本仓库直接包含双架构预编译动态库，clone 后按目标机架构选用即可，无需另行下载：
 
 | 架构 | 动态库目录 | 示例程序目录 | 运行要求 |
 |---|---|---|---|
-| x86_64 | `lib/x86_64/` | `bin/x86_64/` | glibc ≥ 2.34 |
-| aarch64 | `lib/aarch64/` | `bin/aarch64/` | glibc ≥ 2.30 |
+| x86_64 | `lib/x86_64/` | `bin/x86_64/<分类>/` | glibc ≥ 2.34 |
+| aarch64 | `lib/aarch64/` | `bin/aarch64/<分类>/` | glibc ≥ 2.30 |
 
 头文件（`include/`）与接口在两架构间完全一致，只是动态库的二进制架构不同。部署前请先确认目标机的 glibc 版本满足要求：
 
@@ -86,7 +86,7 @@ g++ -std=c++11 main.cpp -Iinclude -Llib/x86_64 -llixel_sdk \
 完整示例见 `examples/record/record_demo.cpp`，预编译产物可直接运行：
 
 ```bash
-./bin/x86_64/record_demo 192.168.123.103 30
+./bin/x86_64/record/record_demo 192.168.123.103 30
 ```
 
 ## 数据订阅
@@ -98,13 +98,17 @@ SDK 支持订阅设备的实时数据流：位姿、点云、IMU、图像、错�
 | 数据类型 | SDK 接口 | 频率 | 坐标系 |
 |----------|----------|------|--------|
 | 位姿 | `subscribePose` | ~100Hz | 设备（IMU）系 |
-| 重定位点云 | `subscribeCloud` | ~10Hz | 设备（IMU）系 |
 | 原始 IMU | `subscribeImu` | ~200Hz | 设备（IMU）系 |
-| 原始点云 | `subscribeRawCloud` | ~10Hz | 雷达去畸变帧 |
-| 图像（左/中/右） | `subscribeImage` | ~2fps | — |
+| Locate 去畸变点云（1.1 起） | `subscribeDeviceUndistCloud` | 随 Locate 输出（频率未验证；建图阶段无数据） | 设备（IMU）系 |
+| 原始雷达点云（全量、未去畸变，仅 RoboSense） | `subscribeDeviceRawCloud` | ~10Hz | 设备（IMU）系 |
+| 图像（左/中/右） | `subscribeImage` | 帧率以设备配置为准（实测 10 Hz） | — |
+| 深度图（中相机） | `subscribeDepth` | 以设备 AI 推理配置为准；设备默认配置（`ai.fps: 0`）下不发布，见下方说明 | 中相机像素平面，深度单位 m |
 | 错误码 | `subscribeErrCode` | ~10Hz | — |
 
-> 位姿与重定位点云均以**设备（IMU）系**为基准，载体安装变换由集成方自行叠加，详见 [docs/coordinate_frames_and_tf.md](docs/coordinate_frames_and_tf.md)。重定位点云是 NDT 配准产物（~10Hz），非原始雷达扫描。
+> 位姿与点云均以**设备（IMU）系**为基准，载体安装变换由集成方自行叠加，详见 [docs/coordinate_frames_and_tf.md](docs/coordinate_frames_and_tf.md)。Locate 去畸变点云是 Locate 的输出，原始雷达点云是 RoboSense 一次完整扫描的全部点（未降采样、未去畸变）。重定位点云订阅已在 1.1 删除。
+> **深度图默认无数据：** 设备端默认配置 `lixel_t1xb.camera_center.ai.fps` 为 0（T1XB 配置文件 `modeling_app_t1xb.yaml`），此时设备不发布 `depth/center`；须由设备端把该项配置为大于 0，且 AI 模型就绪后才有数据。无数据时 `subscribeDepth` 仍返回 `Ok`。
+
+> **时间戳：** 各路 `timestamp_sec` 都是 Unix epoch 秒，但取自不同的时钟，不保证互相对齐：图像取设备系统时钟，深度图沿用图像时间戳（推断），IMU 随平台取 MCU 或雷达时钟，位姿与点云的时基未在设备代码中确认，请按「不保证与设备系统时钟一致」处理。想知道设备系统时钟与本机的偏差用 `getDeviceTime()`（只读，只对图像及沿用其时间戳的深度图成立）。每路依据与换算方法见 [docs/api_reference_v2.md §0.8](docs/api_reference_v2.md#08-时间戳时基与换算)。
 
 ### 数据类型
 
@@ -118,7 +122,7 @@ struct Imu {
 };
 ```
 
-**位姿 / 点云**：位姿见 `xg::Pose`；点云复用 `xg::CloudFrame`。原始点云为去畸变后的完整雷达帧。
+**位姿 / 点云**：位姿见 `xg::Pose`；去畸变点云复用 `xg::CloudFrame`，原始雷达点云用 `xg::RawCloudFrame`。去畸变点云（`device_undist_cloud`）是 Locate 输出的 IMU 系点云，当前输入为驱动层 1/4 降采样，不是雷达全量点；雷达全量点见 `device_raw_cloud`。
 
 ### 快速示例
 
@@ -155,7 +159,7 @@ int main() {
 订阅示例程序：
 
 ```bash
-./bin/x86_64/subscribe_demo 192.168.123.103 60    # 订阅 60 秒
+./bin/x86_64/subscribe/subscribe_demo 192.168.123.103 /tmp/sdk_data 1 1 0.45    # 保存到 /tmp/sdk_data，注入初值 (1,1,0.45) m，Ctrl+C 退出
 ```
 
 完整示例源码见 `examples/subscribe/`。
@@ -163,7 +167,7 @@ int main() {
 ### 使用注意
 
 - **回调在 SDK 内部线程触发**，实现须尽快返回，不可阻塞。若需耗时处理，应将数据拷贝到自有队列后立即返回。
-- **IMU 回调频率很高（~200Hz）**，原始点云数据量较大（数万点/帧），如需持久化建议异步写入。
+- **IMU 回调频率很高（~200Hz）**，去畸变点云数据量较大（数万点/帧），如需持久化建议异步写入。
 - 同一设备句柄每种数据类型最多一个活跃订阅，重复订阅返回 `Error::Rejected`。
 - 不订阅时不消耗网络带宽。
 - `Device` 析构时自动取消所有活跃订阅。
@@ -176,8 +180,8 @@ int main() {
 include/xg/robot_sdk.h        C++ 接口（推荐使用，header-only）
 include/xg/robot_sdk_c.h      C 接口（ABI 真源）
 lib/x86_64/  lib/aarch64/     动态库（按架构分目录，已内含全部第三方依赖）
-bin/x86_64/  bin/aarch64/     预编译示例程序（按架构分目录）
-examples/                     示例源码（connection/record/subscribe/relocation_map/comprehensive）
+bin/x86_64/<分类>/  bin/aarch64/<分类>/   预编译示例程序（先按架构分目录，再按分类分目录）
+examples/<分类>/              示例源码（connection/record/subscribe/relocation_map/network/comprehensive），另含 examples/README.md
 ros2/                         ROS2 Bridge 源码（colcon build 即用）
 docs/                         用户文档（API 参考、数据类型、坐标系、发布说明等）
 README.md
@@ -185,7 +189,9 @@ README.md
 
 头文件（`include/`）、示例源码（`examples/`）、ROS2 桥接（`ros2/`）两架构通用；仅 `lib/` 与 `bin/` 按架构分目录，按目标机架构选用。`liblixel_sdk.so` 已包含全部第三方依赖，除系统库（glibc、libstdc++）外无需额外部署。
 
-`bin/<arch>/` 下的预编译示例已内嵌 rpath，**保持仓库 `bin/<arch>` 与 `lib/<arch>` 的相对目录结构不变，即可直接运行**（如 `./bin/x86_64/record_demo`），无需设置 `LD_LIBRARY_PATH`。
+预编译示例的分类与 `examples/` 的子目录一一对应：`examples/<分类>/<名>.cpp` 的预编译产物是 `bin/<arch>/<分类>/<名>`。各示例的用途与用法见 [examples/README.md](examples/README.md)。
+
+`bin/<arch>/<分类>/` 下的预编译示例已内嵌 rpath，**保持仓库 `bin/<arch>` 与 `lib/<arch>` 的相对目录结构不变，即可直接运行**（如 `./bin/x86_64/record/record_demo`），无需设置 `LD_LIBRARY_PATH`。
 
 系统库依赖只有 glibc 与 libstdc++（`pthread`、`dl`、`m`、`rt` 均属其中），常见 Linux 发行版均自带。可自行核对：
 
@@ -461,6 +467,8 @@ nm -D --defined-only lib/x86_64/liblixel_sdk.so | grep -v ' xg_'
 ## 兼容性
 
 升级 SDK 时请同步更新头文件与库文件，两者版本必须一致，可用 `xg::sdkVersion()` 核对。
+
+动态库 SONAME 为 `liblixel_sdk.so.<主>.<次>`（1.1.0 为 `liblixel_sdk.so.1.1`）：补丁版本只修 Bug，SONAME 不变；次版本允许小范围增删接口，SONAME 随之变化，须重新链接；主版本只在大重构时提升。1.0.0 的 SONAME 是 `liblixel_sdk.so.1`，用 1.0.0 编译的程序不会加载 1.1.0 库，须重新编译，详见 [docs/releases/v1.1.0.md](docs/releases/v1.1.0.md)。
 
 ## 常见问题
 

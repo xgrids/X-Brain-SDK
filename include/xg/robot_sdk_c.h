@@ -59,11 +59,46 @@ extern "C" {
 
 /*=============================================================================
  * 版本
+ *
+ * 版本号的唯一来源是下面三个宏。CMake 工程版本、SOVERSION（取
+ * XG_SDK_VERSION_MAJOR.XG_SDK_VERSION_MINOR，两位）、xg_sdk_version() 返回值、
+ * ROS2 包版本、对外 README 都从这里派生，升级版本只改这三行。
+ * 动态库 SONAME = liblixel_sdk.so.<主>.<次>：补丁版本只修 Bug，SONAME 不变；
+ * 次版本允许小范围增删接口，SONAME 随之变化，集成方须重新链接；
+ * 主版本只在大重构时提升。
+ * 注意：三行须保持 "#define XG_SDK_VERSION_<部件> <十进制数>" 的格式，
+ *       cmake/LixelSdkVersion.cmake 与 ros2/CMakeLists.txt 按此格式解析。
  *===========================================================================*/
 
 #define XG_SDK_VERSION_MAJOR 1
-#define XG_SDK_VERSION_MINOR 0
+#define XG_SDK_VERSION_MINOR 1
 #define XG_SDK_VERSION_PATCH 0
+
+#if XG_SDK_VERSION_MINOR > 99 || XG_SDK_VERSION_PATCH > 99
+#error "XG_SDK_VERSION_MINOR/PATCH must be <= 99 to fit XG_SDK_VERSION_NUMBER"
+#endif
+
+/**
+ * 整数形式版本号：MAJOR * 10000 + MINOR * 100 + PATCH，如 1.1.0 为 10100。
+ * 供集成方按编译期头文件版本做条件编译，例如：
+ *   #if XG_SDK_VERSION_NUMBER >= 10100
+ *       xg_subscribe_depth(...);
+ *   #endif
+ * 只反映编译时头文件的版本；运行时库的版本用 xg_sdk_version() 核对。
+ */
+#define XG_SDK_VERSION_NUMBER                                         \
+    (XG_SDK_VERSION_MAJOR * 10000 + XG_SDK_VERSION_MINOR * 100 + \
+     XG_SDK_VERSION_PATCH)
+
+/* 内部辅助：把宏展开后的数值转成字符串字面量，集成方勿直接使用 */
+#define XG_SDK_VERSION_STR_IMPL_(x) #x
+#define XG_SDK_VERSION_STR_(x) XG_SDK_VERSION_STR_IMPL_(x)
+
+/** 字符串形式版本号，如 "1.1.0"；与同版本库的 xg_sdk_version() 返回值相同 */
+#define XG_SDK_VERSION_STRING                       \
+    XG_SDK_VERSION_STR_(XG_SDK_VERSION_MAJOR) "." \
+    XG_SDK_VERSION_STR_(XG_SDK_VERSION_MINOR) "." \
+    XG_SDK_VERSION_STR_(XG_SDK_VERSION_PATCH)
 
 /*=============================================================================
  * 常量
@@ -285,8 +320,10 @@ XG_API const char* xg_err_str(xg_err_t err);
 XG_API const char* xg_record_state_str(xg_record_state_t state);
 
 /**
- * @brief  取 SDK 版本号
- * @return 形如 "1.0.0" 的静态字符串，不需释放
+ * @brief  取 SDK 版本号（运行时库的版本）
+ * @return "MAJOR.MINOR.PATCH" 形式的静态字符串，不需释放；值等于构建该库时
+ *         头文件的 XG_SDK_VERSION_STRING。与集成方编译时的
+ *         XG_SDK_VERSION_STRING 不同，说明头文件与库版本不匹配。
  */
 XG_API const char* xg_sdk_version(void);
 
@@ -318,6 +355,39 @@ typedef struct {
  * @note  回调在 SDK 内部线程触发，实现须尽快返回，不可阻塞。
  */
 typedef void (*xg_cloud_cb_t)(const xg_cloud_frame_t* frame, void* user_data);
+
+/**
+ * 原始雷达点（设备(IMU)系，未去畸变，未降采样）。
+ * 固定 24 字节布局，无 struct_size，发布后永不改动；需要新字段时另起新类型。
+ */
+typedef struct {
+    float x;                /**< 设备(IMU)系 X 坐标 (m)，线路上四舍五入到 1 mm */
+    float y;                /**< 设备(IMU)系 Y 坐标 (m)，线路上四舍五入到 1 mm */
+    float z;                /**< 设备(IMU)系 Z 坐标 (m)，线路上四舍五入到 1 mm */
+    float intensity;        /**< 雷达反射强度，无单位 */
+    int32_t time_offset_us; /**< 该点相对 frame.timestamp_sec 的偏移 (us)，可为负 */
+    uint16_t ring;          /**< 雷达线束号，超过 65535 时饱和为 65535 */
+    uint16_t reserved;      /**< 保留，集成方须忽略其值（当前实现写 0，预留给逐点标志） */
+} xg_raw_point_t;
+
+/** 原始点云帧数据（xg_subscribe_device_raw_cloud 的回调参数） */
+typedef struct {
+    size_t struct_size;            /**< 由 SDK 填写为 sizeof(xg_raw_cloud_frame_t) */
+    const xg_raw_point_t* points;  /**< 点数组首地址，回调返回后不可再访问 */
+    size_t count;                  /**< 点数量 */
+    double timestamp_sec;          /**< 帧内最早点的采样时刻（雷达自身时钟的 Unix epoch 秒，
+                                        不保证等于设备系统时钟，见 api_reference_v2.md §0.8） */
+    uint32_t seq;                  /**< 设备端雷达 frame_id，不是 SDK 本地计数 */
+} xg_raw_cloud_frame_t;
+
+/**
+ * @brief 原始点云回调函数类型
+ * @param frame     原始点云帧，仅在回调执行期间有效
+ * @param user_data 用户在订阅时传入的上下文指针
+ * @note  回调在 Zenoh 会话接收线程触发，实现须尽快返回，不可阻塞。
+ */
+typedef void (*xg_raw_cloud_cb_t)(const xg_raw_cloud_frame_t* frame,
+                                  void* user_data);
 
 /** 位姿数据（设备/IMU 系，R_W_I；坐标系见 coordinate_frames.md） */
 typedef struct {
@@ -358,29 +428,6 @@ typedef void (*xg_pose_cb_t)(const xg_pose_t* pose, void* user_data);
  * 数据订阅接口
  *===========================================================================*/
 
-/**
- * @brief  订阅点云数据
- * @param  dev       设备句柄
- * @param  cb        回调函数，不可为空
- * @param  user_data 透传给回调的用户指针，可为空
- * @return XG_OK 订阅成功；XG_ERR_INVALID_ARG 参数非法；
- *         XG_ERR_REJECTED 已有活跃的点云订阅（须先取消）
- * @note   同一句柄同时只允许一个点云订阅。若需多个消费者，由集成方在
- *         回调中自行分发。
- * @note   回调在 SDK 内部线程（Zenoh 会话线程）触发，不在调用方线程。
- *         回调中传递的 frame 指针仅在回调执行期间有效。
- */
-XG_API xg_err_t xg_subscribe_cloud(xg_device_t* dev,
-                                   xg_cloud_cb_t cb, void* user_data);
-
-/**
- * @brief  取消点云订阅
- * @param  dev 设备句柄
- * @return XG_OK 取消成功（幂等，无活跃订阅时也返回成功）；
- *         XG_ERR_INVALID_ARG dev 为空
- * @note   返回后保证不再触发点云回调。
- */
-XG_API xg_err_t xg_unsubscribe_cloud(xg_device_t* dev);
 
 /**
  * @brief  订阅位姿数据
@@ -445,25 +492,91 @@ XG_API xg_err_t xg_subscribe_imu(xg_device_t* dev,
 XG_API xg_err_t xg_unsubscribe_imu(xg_device_t* dev);
 
 /**
- * @brief  订阅原始点云数据
+ * @brief  订阅设备(IMU)系 Locate 去畸变点云（Zenoh key: device_undist_cloud）
  * @param  dev       设备句柄
  * @param  cb        回调函数，不可为空
  * @param  user_data 透传给回调的用户指针，可为空
- * @return XG_OK 订阅成功；XG_ERR_REJECTED 已有活跃订阅
- * @note   回调在 SDK 内部线程触发，频率取决于雷达帧率（约 10Hz）。
- * @note   该点云为 SLAM **去畸变后的单帧扫描**（已做运动补偿），但**未经建图
- *         配准/拼接**，处于传感器帧坐标系；与 xg_subscribe_cloud 的 reloc
- *         配准点云（NDT 产物、设备/IMU 系）语义不同。
+ * @return XG_OK 订阅成功（设备端暂无该 key 数据时同样返回 XG_OK，只是暂无回调）；
+ *         XG_ERR_INVALID_ARG dev 或 cb 为空；
+ *         XG_ERR_REJECTED 本句柄已有去畸变点云订阅（须先取消）；
+ *         XG_ERR_INTERNAL Zenoh 订阅声明失败
+ * @note   数据：设备端 Locate 输出的去畸变点云（imu_cloud），点坐标为设备(IMU)系，
+ *         时间戳为该帧 Locate 输出时间戳（秒）。当前 Locate 输入为驱动层 1/4 降采样点云；全量输入属 locate-full-cloud-feed（RFC 状态：提案，未实现）。
+ *         频率随 Locate 输出（量级 10Hz，未实测）。
+ * @note   语义变更（1.1）：旧语义为 SLAM 去畸变单帧、上游 1/4 降采样。
+ *         新语义下内容来源为 Locate 输出，点数取决于 Locate 输入（未验证）。
+ *         重定位点云订阅 xg_subscribe_device_reloc_cloud 已在 1.1 删除，
+ *         本 key 是 Locate 点云的唯一入口。
+ * @note   无数据的情况（订阅仍返回 XG_OK，SDK 无法区分）：建图阶段
+ *         Locate 未输出时本 key 无数据。
+ * @note   丢帧判断：frame.seq 是 SDK 本地订阅计数（自订阅起递增），不是设备
+ *         帧号，不能用其跳变发现丢帧；点云丢帧只能用相邻帧 timestamp_sec 的
+ *         间隔判断。
+ * @note   线程：回调在 Zenoh 会话接收线程触发，不在调用方线程；回调内禁止
+ *         同步文件 IO、join、startLocate 等阻塞操作，禁止再调同一句柄的 SDK 接口。
+ *         阻塞会拖住本进程全部订阅。回调单次耗时上限：待定（ms，未确定）。
+ *         单帧点数多，回调内请只做拷贝或入队。
+ * @note   内存：frame 及 frame->points 由 SDK 持有，仅回调执行期间有效，
+ *         下一帧覆盖同一缓冲；需保留须在回调内深拷贝，禁止 free/delete。
+ * @note   失败后状态：返回非 XG_OK 时不登记订阅、不保存 cb，可修正后重试；
+ *         XG_ERR_REJECTED 不影响已有订阅。
  */
-XG_API xg_err_t xg_subscribe_raw_cloud(xg_device_t* dev,
-                                       xg_cloud_cb_t cb, void* user_data);
+XG_API xg_err_t xg_subscribe_device_undist_cloud(xg_device_t* dev,
+                                                    xg_cloud_cb_t cb,
+                                                    void* user_data);
 
 /**
- * @brief  取消原始点云订阅
+ * @brief  取消设备(IMU)系 SLAM 去畸变点云订阅
  * @param  dev 设备句柄
- * @return XG_OK 取消成功（幂等）
+ * @return XG_OK 取消成功（幂等，无活跃订阅时也返回成功）；
+ *         XG_ERR_INVALID_ARG dev 为空
+ * @note   返回后保证不再触发该回调。禁止在该订阅自己的回调内调用。
  */
-XG_API xg_err_t xg_unsubscribe_raw_cloud(xg_device_t* dev);
+XG_API xg_err_t xg_unsubscribe_device_undist_cloud(xg_device_t* dev);
+
+/**
+ * @brief  订阅设备(IMU)系原始雷达点云（Zenoh key: device_raw_cloud）
+ * @param  dev       设备句柄
+ * @param  cb        回调函数，不可为空
+ * @param  user_data 透传给回调的用户指针，可为空
+ * @return XG_OK 订阅成功（设备端暂无该 key 数据时同样返回 XG_OK，只是暂无回调）；
+ *         XG_ERR_INVALID_ARG dev 或 cb 为空；
+ *         XG_ERR_REJECTED 本句柄已有原始点云订阅（须先取消）；
+ *         XG_ERR_INTERNAL Zenoh 订阅声明失败
+ * @note   数据：RoboSense 一次完整扫描的全部点，~10Hz。不做降采样，不做运动
+ *         去畸变；只做静态外参刚体变换，把点从雷达系变换到设备(IMU)系
+ *         （外参为 extrinsic_imu_lidar，Lidar→IMU，见 xg_lidar_calib_t）。
+ *         集成方用每点的 time_offset_us 配合自己的位姿自行去畸变。
+ *         不过滤被屏蔽线束。与 device_undist_cloud
+ *         语义不同，订阅槽互相独立。
+ * @note   无数据的情况（订阅仍返回 XG_OK，SDK 无法区分）：设备雷达不是
+ *         RoboSense；设备端外参文件不可用（该帧被丢弃）；设备未处于扫描状态；
+ *         设备端拥塞丢帧（可用 frame.seq 的跳变发现，本路 seq 取设备雷达
+ *         frame_id）。
+ * @note   线路精度：坐标在设备端四舍五入到 1 mm（最大误差 0.5 mm）。
+ * @note   线程：回调在 Zenoh 会话接收线程触发，不在调用方线程；
+ *         回调内禁止阻塞、禁止再调同一句柄的 SDK 接口。阻塞会拖住本进程
+ *         全部订阅。
+ * @note   内存：frame 及 frame->points 由 SDK 持有（线程本地复用缓冲），
+ *         仅回调执行期间有效；需保留须在回调内深拷贝，禁止 free/delete。
+ *         单帧点数多，回调内请只做拷贝或入队。
+ * @note   失败后状态：返回非 XG_OK 时不登记订阅、不保存 cb，可修正后重试；
+ *         XG_ERR_REJECTED 不影响已有订阅。
+ * @note   禁止用法：保存 frame->points 指针到回调之外；在回调内取消订阅或
+ *         关闭句柄。
+ */
+XG_API xg_err_t xg_subscribe_device_raw_cloud(xg_device_t* dev,
+                                              xg_raw_cloud_cb_t cb,
+                                              void* user_data);
+
+/**
+ * @brief  取消设备(IMU)系原始点云订阅
+ * @param  dev 设备句柄
+ * @return XG_OK 取消成功（幂等，无活跃订阅时也返回成功）；
+ *         XG_ERR_INVALID_ARG dev 为空
+ * @note   返回后保证不再触发该回调。禁止在该订阅自己的回调内调用。
+ */
+XG_API xg_err_t xg_unsubscribe_device_raw_cloud(xg_device_t* dev);
 
 /*=============================================================================
  * 图像数据订阅
@@ -502,7 +615,7 @@ typedef void (*xg_image_cb_t)(const xg_image_frame_t* frame, void* user_data);
  * @param  user_data  透传给回调的用户指针，可为空
  * @return XG_OK 订阅成功；XG_ERR_INVALID_ARG 参数非法；
  *         XG_ERR_REJECTED 该相机已有活跃订阅（须先取消）
- * @note   回调频率取决于设备端 JPEG 编码配置（默认 2fps）。
+ * @note   回调频率取决于设备端 JPEG 编码配置（帧率以设备配置为准，实测 10 Hz）。
  *         回调中 jpeg_data 指针仅在回调执行期间有效。
  */
 XG_API xg_err_t xg_subscribe_image(xg_device_t* dev, xg_camera_id_t camera_id,
@@ -515,6 +628,56 @@ XG_API xg_err_t xg_subscribe_image(xg_device_t* dev, xg_camera_id_t camera_id,
  * @return XG_OK 取消成功（幂等）
  */
 XG_API xg_err_t xg_unsubscribe_image(xg_device_t* dev, xg_camera_id_t camera_id);
+
+/*=============================================================================
+ * 深度图数据订阅
+ *===========================================================================*/
+
+/** 深度图帧数据(AI 推理产出的度量深度, 单位米) */
+typedef struct {
+    size_t struct_size; /**< 必须由 SDK 填写为 sizeof(xg_depth_frame_t) */
+    xg_camera_id_t camera_id; /**< 相机标识, 当前仅 XG_CAMERA_CENTER 有效 */
+    double timestamp_sec;     /**< 时间戳（秒） */
+    uint32_t width;      /**< 深度图宽度（像素） */
+    uint32_t height;     /**< 深度图高度（像素） */
+    const float* depth_data; /**< 度量深度裸数据指针(行优先, 单位米, 未命中
+                                  区域为 0), 回调返回后不可再访问 */
+    size_t depth_size;   /**< depth_data 字节数, 等于 width*height*sizeof(float) */
+    uint32_t seq;        /**< 帧序号，自订阅起单调递增 */
+} xg_depth_frame_t;
+
+/**
+ * @brief 深度图回调函数类型
+ * @param frame     深度图帧数据，仅在回调执行期间有效
+ * @param user_data 用户在订阅时传入的上下文指针
+ * @note  回调在 SDK 内部线程触发，实现须尽快返回，不可阻塞。
+ */
+typedef void (*xg_depth_cb_t)(const xg_depth_frame_t* frame, void* user_data);
+
+/**
+ * @brief  订阅深度图数据(AI 推理产出, 目前仅中间相机支持)
+ * @param  dev        设备句柄
+ * @param  camera_id  相机标识（当前仅 XG_CAMERA_CENTER 有数据）
+ * @param  cb         回调函数，不可为空
+ * @param  user_data  透传给回调的用户指针，可为空
+ * @return XG_OK 订阅成功；XG_ERR_INVALID_ARG 参数非法；
+ *         XG_ERR_REJECTED 该相机已有活跃订阅（须先取消）
+ * @note   设备未开启 AI 推理功能时不会有数据推送，订阅本身仍返回 XG_OK。
+ *         设备端默认配置 lixel_t1xb.camera_center.ai.fps 为 0，此时设备不发布
+ *         depth/center；须设备端把该项配置为大于 0 且 AI 模型加载成功后才有数据。
+ *         回调中 depth_data 指针仅在回调执行期间有效。
+ */
+XG_API xg_err_t xg_subscribe_depth(xg_device_t* dev, xg_camera_id_t camera_id,
+                                   xg_depth_cb_t cb, void* user_data);
+
+/**
+ * @brief  取消深度图订阅
+ * @param  dev       设备句柄
+ * @param  camera_id 相机标识
+ * @return XG_OK 取消成功（幂等）
+ */
+XG_API xg_err_t xg_unsubscribe_depth(xg_device_t* dev,
+                                     xg_camera_id_t camera_id);
 
 
 /*=============================================================================
@@ -633,6 +796,60 @@ typedef struct {
 XG_API xg_err_t xg_get_device_info(xg_device_t* dev, xg_device_info_t* out);
 
 /*=============================================================================
+ * 设备时间查询（只读）
+ *===========================================================================*/
+/**
+ * 设备系统时钟快照及本机往返时刻。
+ *
+ * 量纲：所有 *_epoch_us 均为自 1970-01-01 00:00:00 UTC 起的微秒（Unix epoch），
+ * 与各订阅数据的 timestamp_sec 同量纲：timestamp_sec * 1e6 可直接与
+ * device_epoch_us 相减。但「同量纲」不等于「同一个时钟」：哪些订阅数据取自
+ * 设备系统时钟、哪些取自 MCU / 雷达时钟，见 api_reference_v2.md §0.8，
+ * 只有取自设备系统时钟的数据才能直接与 device_epoch_us 比较。
+ */
+typedef struct {
+    size_t struct_size;        /**< 必须由调用方填写为 sizeof(xg_device_time_t) */
+    int64_t device_epoch_us;   /**< 设备系统时钟（CLOCK_REALTIME），Unix epoch 微秒。
+                                    设备在状态查询完成后、序列化应答之前采样 */
+    int32_t utc_offset_s;      /**< 设备本地时区相对 UTC 的偏移（秒，含夏令时）。
+                                    只用于显示本地时间，与 epoch 值无关 */
+    int32_t reserved;          /**< 保留，SDK 写 0，集成方须忽略 */
+    int64_t host_send_epoch_us;/**< 本机发出查询时的 system_clock（Unix epoch 微秒） */
+    int64_t host_recv_epoch_us;/**< 本机收到应答时的 system_clock（Unix epoch 微秒） */
+    int64_t rtt_us;            /**< 本机用 steady_clock 测得的往返时延（微秒） */
+} xg_device_time_t;
+
+/**
+ * @brief  查询设备系统时间（只读，不修改设备时间）
+ * @param  dev 设备句柄
+ * @param  out 输出，不可为空，须先填好 struct_size
+ * @return XG_OK 成功；
+ *         XG_ERR_INVALID_ARG dev 或 out 为空，或 struct_size 不匹配；
+ *         XG_ERR_TIMEOUT 未收到应答；
+ *         XG_ERR_PROTOCOL 应答无法解析，或设备固件不支持本查询（应答里没有
+ *         time 字段，旧固件即是如此），或 epoch_us / utc_offset_s 缺失、
+ *         不是 int64 范围内的整数、超出合法范围
+ * @note   与设备时钟的偏差只能得到一个区间：设备采样时刻位于本机
+ *         [host_send_epoch_us, host_recv_epoch_us] 之内，因此
+ *         offset = 设备时钟 - 本机时钟 满足
+ *         device_epoch_us - host_recv_epoch_us <= offset
+ *                                              <= device_epoch_us - host_send_epoch_us
+ *         区间宽度等于 host_recv_epoch_us - host_send_epoch_us，比 rtt_us 多出
+ *         几次时钟读取的开销（微秒量级），不依赖去程与回程对称。本机
+ *         system_clock 在查询期间被调整（NTP 跳变等）时，区间无意义。
+ * @note   设备应答的是 getDeviceStatus，设备状态查询失败时仍会带回时间，
+ *         本接口此时返回 XG_OK。
+ * @note   线程：同步阻塞调用线程，最长 3.5 s（查询超时 3 s 加 0.5 s 余量）；
+ *         同一句柄不可重入。
+ * @note   失败后状态：除 struct_size 不匹配外，返回非 XG_OK 时 out 除 struct_size
+ *         外全部置 0，不得使用；struct_size 不匹配时无法确定 out 的大小，out 保持
+ *         原样（C++ 封装的 getDeviceTime 失败时一律把 DeviceTime 清零）。
+ * @note   禁止用法：把 device_epoch_us 当作 MCU 或雷达时钟读数使用；用本接口
+ *         修改设备时间（本接口只读，SDK 不提供设置设备时间的能力）。
+ */
+XG_API xg_err_t xg_get_device_time(xg_device_t* dev, xg_device_time_t* out);
+
+/*=============================================================================
  * 定位初始位姿设置
  *===========================================================================*/
 
@@ -650,13 +867,16 @@ typedef struct {
 } xg_init_pose_t;
 
 /**
- * @brief  设置定位初始位姿（用于重定位）
+ * @brief  设置定位初始位姿，并启动设备端 Locate 算法
  * @param  dev   设备句柄
  * @param  pose  初始位姿参数，不可为空，须先填好 struct_size
- * @return XG_OK 设备已接受；XG_ERR_TIMEOUT 设备未应答；
- *         XG_ERR_REJECTED 设备拒绝（如四元数模长不合法）
- * @note   当设备需要在已有地图上重新定位时，可通过本接口提供初始位姿估计，
- *         帮助定位算法加速收敛。四元数须满足模长 > 0.1 的约束。
+ * @return XG_OK 设备已收下初值且 Locate 算法已启动；XG_ERR_TIMEOUT 设备未应答；
+ *         XG_ERR_REJECTED 设备拒绝（如四元数模长不合法、定位尚未初始化）
+ * @note   设备端 Locate 的时序是：录制启动时完成初始化 -> 本接口喂入初值并启动算法。
+ *         设备进入 Recording 时初始化已完成。本接口是启动 Locate 的必经步骤：
+ *         调用前设备不发布位姿（xg_subscribe_pose）和 Locate 去畸变点云
+ *         （xg_subscribe_device_undist_cloud）。XG_OK 不代表重定位完成。
+ *         四元数模长须大于 0.1。
  */
 XG_API xg_err_t xg_set_loc_init_pose(xg_device_t* dev,
                                       const xg_init_pose_t* pose);
@@ -682,6 +902,70 @@ typedef struct {
  * @note   录制期间返回当前活跃工程路径；未录制时返回上一次工程路径或空串。
  */
 XG_API xg_err_t xg_get_data_path(xg_device_t* dev, xg_data_path_t* out);
+
+/*=============================================================================
+ * 设备网络配置（修改设备对外网口的 IP 与网段）
+ *
+ * 采用「限时确认」流程，超时未确认则设备自动回滚：
+ *   1. 在当前能到达设备的地址上调用 xg_set_device_network()；
+ *   2. 设备应答后应用新配置，经被修改网口建立的连接随之中断；
+ *   3. 关闭旧句柄，用此刻能到达设备的地址重新 xg_device_open()：新 IP
+ *      （本机须能到达新网段，SDK 不修改主机网络），或经 USB 等其他网卡
+ *      可达的设备地址；
+ *   4. 在 confirm_timeout_s 内调用 xg_confirm_device_network()。
+ * 经新 IP 确认可证明新地址可达；经其他网卡确认只证明设备在线。
+ *===========================================================================*/
+
+/** confirm_timeout_s 的取值范围（秒），传 0 取默认值 */
+#define XG_NETWORK_CONFIRM_TIMEOUT_MIN_S 10
+#define XG_NETWORK_CONFIRM_TIMEOUT_MAX_S 120
+#define XG_NETWORK_CONFIRM_TIMEOUT_DEFAULT_S 60
+
+/** prefix_len 的取值范围 */
+#define XG_NETWORK_PREFIX_MIN 8
+#define XG_NETWORK_PREFIX_MAX 30
+
+/**
+ * @brief  修改设备对外网口的 IP 与网段（需随后确认，否则自动回滚）
+ * @param  dev               设备句柄
+ * @param  ip                新 IPv4 地址，点分十进制
+ * @param  prefix_len        前缀长度，范围 [XG_NETWORK_PREFIX_MIN, XG_NETWORK_PREFIX_MAX]
+ * @param  gateway           NULL 保持现有网关（不在新网段内则设备拒绝）；
+ *                           "" 删除默认路由；其他为新网关，须在新网段内且不等于 ip
+ * @param  confirm_timeout_s 确认窗口（秒），0 为默认值，否则范围
+ *                           [XG_NETWORK_CONFIRM_TIMEOUT_MIN_S, XG_NETWORK_CONFIRM_TIMEOUT_MAX_S]，
+ *                           从设备完成地址切换起算
+ * @return XG_OK 设备已接受，不代表已生效；XG_ERR_INVALID_ARG 参数非法（发送前
+ *         本地校验，设备配置不变）；XG_ERR_TIMEOUT 结果未知，请用新旧地址分别
+ *         探测；XG_ERR_REJECTED 设备拒绝，配置不变（扫描中、已有变更待确认、
+ *         网段与其他网口重叠等，原因见设备日志）；XG_ERR_PROTOCOL 应答无法
+ *         解析或固件不支持本命令
+ * @note   同步阻塞，同一句柄不可重入。只作用于设备对外网口。
+ * @note   XG_OK 之后只允许对 dev 调用 xg_device_close()：经被修改网口连接时
+ *         连接会中断、订阅全部停止；确认请使用重新打开的句柄。
+ * @note   对外网口没插网线时，设备无法校验新地址是否生效，只依据 netplan 的
+ *         应用结果，插上网线后新地址才会出现。
+ * @note   与设备当前配置完全相同时直接视为已确认，连接不中断。
+ * @note   确认窗口内设备重启则不再回滚，新配置保留。
+ * @warning 确认窗口内禁止再次调用本函数。
+ */
+XG_API xg_err_t xg_set_device_network(xg_device_t* dev, const char* ip,
+                                       int prefix_len, const char* gateway,
+                                       int confirm_timeout_s);
+
+/**
+ * @brief  确认设备网络配置变更，取消自动回滚
+ * @param  dev 设备句柄，须为 xg_set_device_network 成功后重新打开的句柄
+ * @return XG_OK 已确认（幂等，重复调用仍返回 XG_OK）；XG_ERR_INVALID_ARG dev 为空；
+ *         XG_ERR_TIMEOUT 结果未知，可直接重试；XG_ERR_REJECTED 设备没有可确认的
+ *         变更（窗口已过期并回滚、应用失败、从未发起，或设备还没应用完新配置）；
+ *         XG_ERR_PROTOCOL 应答无法解析或固件不支持本命令
+ * @note   设备在应答 xg_set_device_network 后约 1 秒才应用新配置。经 USB 等不受
+ *         影响的连接确认时，确认可能早于应用到达而被拒绝，请在确认窗口内重试。
+ * @note   「已确认」「已回滚」的记录只在设备应用进程内存里，应用重启后一律
+ *         返回 XG_ERR_REJECTED。
+ */
+XG_API xg_err_t xg_confirm_device_network(xg_device_t* dev);
 
 /*=============================================================================
  * 错误码订阅
@@ -765,7 +1049,7 @@ typedef void (*xg_map_progress_cb_t)(float progress, void* user_data);
  * @return XG_OK 成功就绪；XG_ERR_INVALID_ARG 参数非法；XG_ERR_NOT_CONNECTED 未连接；
  *         XG_ERR_TIMEOUT 超时；XG_ERR_REJECTED 设备拒绝（磁盘不足/mapId 冲突/校验失败）；
  *         XG_ERR_INTERNAL 本地打包或传输失败
- * @note   上传后需调 xg_set_active_map 激活，再（可选）xg_set_loc_init_pose 给初值。
+ * @note   上传后需调 xg_set_active_map 激活，再调 xg_set_loc_init_pose 给初值（同时启动 Locate）。
  */
 XG_API xg_err_t xg_upload_map(xg_device_t* dev,
                               const xg_map_upload_opts_t* opts,

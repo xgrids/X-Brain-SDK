@@ -2,7 +2,7 @@
 
 本文档面向集成方开发人员，提供 SDK 使用的完整参考，包括坐标系概念、数据订阅、ROS2 桥接、测试验证与排障。
 
-基础接口说明（连接、录制启停、编译链接）请参阅根目录 [README.md](../README.md)。完整 C/C++ 契约见 [api_reference_v2.md](api_reference_v2.md)，各版 Release Note 见 [releases/](releases/README.md)。
+基础接口说明（连接、录制启停、编译链接）请参阅根目录 [README.md](../README.md)。完整 C/C++ 契约见 [api_reference_v2.md](api_reference_v2.md)，当前版本的 Release Note 见 [releases/v1.1.0.md](releases/v1.1.0.md)。
 
 尚未提供的能力请勿据本文推测。
 
@@ -50,14 +50,16 @@ SDK 通过 `subscribePose()` 回调输出的位姿数据（~100Hz）：
 
 ### 1.3 点云数据
 
-`subscribeCloud()` 回调输出的是设备（IMU）系点云（~10Hz），来自重定位算法：
+`subscribeDeviceUndistCloud()` 回调输出的是设备（IMU）系 Locate 去畸变点云（1.1 起；建图阶段 Locate 未输出时无数据）：
 
 | 字段 | 单位 | 说明 |
 |------|------|------|
 | x, y, z | 米 | 点在设备（IMU）系下的坐标 |
 | intensity | — | 反射强度 |
 
-注意：该点云不是每帧 LiDAR 完整扫描，而是重定位算法配准处理后的结果，频率约 10Hz。每帧去畸变原始扫描需通过 `subscribeRawCloud()`（~10Hz）获取。
+注意：`subscribeDeviceRelocCloud()` 已在 1.1 删除。回调运行在 Zenoh RX 线程，回调内禁止同步文件 IO、`join`、`startLocate`。
+
+需要雷达全量点、并自行做运动去畸变时，订阅 `subscribeDeviceRawCloud()`（RoboSense 设备，~10Hz）：每帧是一次完整扫描的全部点，未降采样、未去畸变，设备（IMU）系；每个点带 `time_offset_us`（相对帧时间的微秒偏移）和 `ring`。坐标精度 1 mm。接口细节见 `api_reference_v2.md` 的 §3.3.1 与 §7.2.1，示例见 `examples/subscribe/raw_cloud_demo.cpp`。
 
 ### 1.4 IMU 数据
 
@@ -79,6 +81,19 @@ SDK 通过 `subscribePose()` 回调输出的位姿数据（~100Hz）：
 | Right (2) | 右相机 | 针孔，~10fps |
 
 注意：图像发布依赖设备端录制状态和固件版本。
+
+### 1.5.1 深度图
+
+`subscribeDepth()` 订阅中间相机的 AI 深度图（key `depth/center`，度量深度，单位 m，行优先 float）。**设备端默认配置下不发布此 key：** T1XB 配置文件 `modeling_app_t1xb.yaml` 中 `lixel_t1xb.camera_center.ai.fps` 默认为 0，须设备端把该项配置为大于 0 且 AI 模型就绪后才有数据；无数据时订阅仍返回 `Ok`，SDK 无法区分原因。接口定义以 [`robot_sdk_c.h`](../include/xg/robot_sdk_c.h) 的 `xg_subscribe_depth` 为准，示例见 `examples/subscribe/depth_demo.cpp`。
+
+### 1.6 时间戳与时钟
+
+各路数据的 `timestamp_sec` 都是 Unix epoch 秒，但**取自不同的时钟**：图像取设备系统时钟，深度图沿用图像时间戳（推断）；IMU 随平台取 MCU 时钟或雷达时钟；位姿与点云的时基未在设备代码中确认。同一台设备上它们之间不保证对齐，也不保证等于设备系统时间。
+
+- 想知道设备系统时钟和本机差多少：调用 `getDeviceTime()`，得到偏差区间（宽度略大于往返时延）。该偏差只对图像及沿用其时间戳的深度图成立。示例见 `examples/subscribe/image_demo.cpp`（把图像时间换到本机时钟，估算收到时相对设备时间戳的延迟，区间没有计入设备端固定补偿和取帧口径）和 `examples/connection/device_info_demo.cpp`。
+- 要把 IMU、位姿、点云与本机或其他传感器严格对齐：须在设备侧做时间同步，`getDeviceTime()` 不能替代。
+- 每路数据取自哪个时钟、换算公式与使用限制，唯一详写处是 [api_reference_v2.md §0.8](api_reference_v2.md#08-时间戳时基与换算)。
+- `getDeviceTime()` 是只读查询，SDK 不提供设置设备时间的能力；旧固件不支持时返回 `Protocol`。
 
 ---
 
@@ -137,8 +152,8 @@ int main() {
         std::printf("pos=(%.3f,%.3f,%.3f)\n", p.posX, p.posY, p.posZ);
     });
 
-    // 订阅点云
-    device->subscribeCloud([](const xg::CloudFrame& f) {
+    // 订阅设备(IMU)系 Locate 去畸变点云
+    device->subscribeDeviceUndistCloud([](const xg::CloudFrame& f) {
         std::printf("cloud: %zu points\n", f.count);
     });
 
@@ -194,74 +209,45 @@ if (device->getLidarCalib(&lidar) == xg::Error::Ok) {
 
 ## 4. ROS2 桥接
 
-SDK 提供 `lixel_sdk_ros2` 包，将 SDK 数据桥接为标准 ROS2 Topic。
+SDK 提供 `lixel_ros` 包（源码在 `ros2/`），将 SDK 数据桥接为标准 ROS2 Topic。**话题表、坐标系、外参、参数文件的权威说明只在 [`ros2/README.md`](../ros2/README.md)**，本节只给最短路径。
 
 ### 4.1 编译
 
 ```bash
-# 前提：ROS2 Humble 已安装，SDK 已编译
-mkdir -p ~/ros2_ws/src
-ln -sf <sdk_path>/ros2 ~/ros2_ws/src/lixel_sdk_ros2
-
-cd ~/ros2_ws
+# 前提：ROS2 Humble 已安装；ros2/ 与 include/、lib/<arch>/ 平级（发布包默认如此）
+cd <sdk_path>/ros2
 source /opt/ros/humble/setup.bash
-colcon build --packages-select lixel_sdk_ros2
-source install/setup.bash
+colcon build --packages-select lixel_ros
 ```
 
 ### 4.2 运行
 
+先用 SDK 完成设备侧流程（初始化、设置初始位姿、`startRecord()`），桥接节点只订阅数据，不启停录制：
+
 ```bash
-# 设置 SDK 库路径
-export LD_LIBRARY_PATH=<sdk_path>/build-x86_64:$LD_LIBRARY_PATH
-
-# 运行
-ros2 run lixel_sdk_ros2 sdk_bridge_node --ros-args -p device_ip:=192.168.55.1
-
-# 或使用 launch
-ros2 launch lixel_sdk_ros2 sdk_bridge.launch.py device_ip:=192.168.55.1
+bash <sdk_path>/ros2/start_lixel_ros.sh                     # 参数全部来自 config/default_params.yaml
+bash <sdk_path>/ros2/start_lixel_ros.sh device_ip:=192.168.123.103   # 只覆盖设备 IP
 ```
 
-### 4.3 发布的 Topic
+### 4.3 发布的 Topic 与 TF
 
-| Topic | 消息类型 | 频率 | 说明 |
-|-------|---------|------|------|
-| `/odom` | nav_msgs/Odometry | ~100Hz | 位姿（含外参变换） |
-| `/tf` | tf2_msgs/TFMessage | ~100Hz | 动态 TF (odom → sensor_link) |
-| `/tf_static` | tf2_msgs/TFMessage | 启动一次 | 静态 TF (sensor_link → base_link) |
-| `/cloud_points` | sensor_msgs/PointCloud2 | ~10Hz | 点云 |
-| `/lixel/camera/*/compressed` | sensor_msgs/CompressedImage | ~2fps | 相机图像 |
+| Topic | 消息类型 | 说明 |
+|-------|---------|------|
+| `/odom` | nav_msgs/Odometry | `map → base_link`（已叠加外参，`base_link` 为 ROS 直出的 ODOM 坐标系） |
+| `/tf` | tf2_msgs/TFMessage | 动态 TF `map → imu_link` |
+| `/tf_static` | tf2_msgs/TFMessage | 静态 TF `imu_link → base_link`（外参，启动时发一次） |
+| `/lixel/device_undist_cloud` | sensor_msgs/PointCloud2 | 设备(IMU)系 Locate 去畸变点云，frame `imu_link` |
+| `/lixel/imu` | sensor_msgs/Imu | 原始 IMU |
+| `/lixel/camera/*/compressed` | sensor_msgs/CompressedImage | 相机图像，帧率以设备配置为准 |
 
-### 4.4 TF 树
-
-```
-odom
- └── sensor_link  (动态，~100Hz)
-      └── base_link  (静态，外参)
-```
-
-### 4.5 外参配置
-
-编辑 `ros2/config/default_params.yaml`：
-
-```yaml
-sdk_bridge_node:
-  ros__parameters:
-    device_ip: "192.168.55.1"
-    static_tf:
-      translation: [-0.29242062, 0.0, -0.41988808]       # sensor→base 位移 (m)
-      rotation_quat: [0.0, -0.17395643, 0.0, 0.98475335] # [x, y, z, w]
-    use_omega_cross_r: true  # 速度变换含杆臂补偿
-```
-
-外参含义：`translation` 是 base_link 原点在 sensor_link 系中的位移，`rotation_quat` 是 sensor→base 的旋转。
+频率、frame 定义与外参换算见 [`ros2/README.md`](../ros2/README.md)。
 
 ### 4.6 RViz2 可视化
 
 ```bash
 rviz2
-# Fixed Frame: odom
-# 添加 TF / Odometry (/odom) / PointCloud2 (/cloud_points)
+# Fixed Frame: map
+# 添加 TF / Odometry (/odom) / PointCloud2 (/lixel/device_undist_cloud)
 ```
 
 ---
@@ -278,14 +264,14 @@ nc -zv <设备IP> 7448    # modeling_app（SDK 唯一需要的端口）
 ### 5.2 SDK 直接测试
 
 ```bash
-# 录制控制测试
-./record_demo <设备IP> 10
+# 录制控制测试（预编译产物在 bin/<arch>/<分类>/，以下以 x86_64 为例）
+./bin/x86_64/record/record_demo <设备IP> 10
 
 # 数据订阅测试
-./subscribe_demo <设备IP>
+./bin/x86_64/subscribe/subscribe_demo <设备IP> [输出目录|-] [X] [Y] [Z]   # 自带 setLocInitPose，X/Y/Z 为地图系初值(m)，默认 0 0 0
 
 # 全功能测试
-./all_features_demo <设备IP>
+./bin/x86_64/comprehensive/all_features_demo <设备IP> [订阅秒=15] [X=0] [Y=0] [Z=0]   # 自带 setLocInitPose，X/Y/Z 为地图系初值(m)，默认 0 0 0；默认值在本机地图上可能重定位失败，请传设备实际所在附近的坐标
 ```
 
 ### 5.3 设备端验证（SSH 到设备）
@@ -332,7 +318,7 @@ ros2 run tf2_tools view_frames  # 查看 TF 树
 
 ### 新设备端口变化的诊断
 
-部分新设备（如 V3.3.x 固件）的进程架构可能与老设备不同。确认方法：
+部分新设备（新版固件）的进程架构可能与老设备不同。确认方法：
 
 ```bash
 # SSH 到设备
@@ -351,8 +337,7 @@ systemctl list-units --type=service | grep xgrids
 | 数据类型 | 单帧大小 | 频率 | 带宽 |
 |---------|---------|------|------|
 | 位姿 | ~200B | 100Hz | ~20 KB/s |
-| 重定位点云 | ~100KB | 10Hz | ~1 MB/s |
-| 原始点云 | ~1-3MB | 10Hz | ~10-30 MB/s |
+| 去畸变点云 | ~1-3MB | 10Hz | ~10-30 MB/s |
 | IMU | ~50B | 200Hz | ~10 KB/s |
 | 相机 JPEG | ~50-200KB | 10Hz/路 | ~1-2 MB/s/路 |
 
@@ -360,8 +345,4 @@ systemctl list-units --type=service | grep xgrids
 
 ## 8. 接口版本变更记录
 
-| 版本 | 新增接口 |
-|------|---------|
-| v0.1.0 | 录制启停、状态查询 |
-| v0.2.0 | 位姿订阅、重定位点云订阅 |
-| v0.3.1 | IMU 订阅、原始点云订阅、相机图像订阅、标定参数查询、设备信息查询、初始位姿设置 |
+当前版本（1.1.0）的接口变更见 [releases/v1.1.0.md](releases/v1.1.0.md)；只保留最新版本的发布说明，历史版本见 git 历史。

@@ -52,7 +52,7 @@ ROS 的坐标约定（REP-103）在业界被广泛采用，要点（内容依据
 
 ### 3.1 SDK 输出的坐标系
 
-SDK 订阅设备的 `device_locate`（位姿）与 `reloc_device_cloud`（reloc 点云），二者均为**设备（IMU）系**：
+SDK 订阅设备的 `device_locate`（位姿）与 `device_undist_cloud`（Locate 去畸变点云，1.1 起语义变更，`device_reloc_cloud` 已删除），二者均为**设备（IMU）系**：
 
 - **原点**：设备 IMU 芯片安装点（整机唯一基准）。
 - **朝向**：右手系，x 前 / y 左 / z 上（REP-103）。
@@ -60,17 +60,18 @@ SDK 订阅设备的 `device_locate`（位姿）与 `reloc_device_cloud`（reloc 
 
 > 设备端定位算法内部还有一套 Body/载体系（经外参偏移到"载体控制中心"），但**那套仅供设备内部导航，不经 SDK**。SDK 对外只给设备系，消除"到底是设备还是载体"的歧义。详见设备端 `coordinate_frames.md`。
 
-### 3.2 ROS 桥接的 TF 结构（极简两层）
+### 3.2 ROS 桥接的 TF 结构
 
 ```
-map ──(动态, ~100Hz, 来自 device_locate)──► base_link
- └ 世界/地图系                              └ 设备(IMU)基准
+map ──(动态, ~100Hz, 来自 device_locate)──► imu_link ──(静态, 外参)──► base_link
+ └ 世界/地图系                              └ 设备(IMU)系（SDK 直出）    └ ODOM 坐标系（ROS 直出）
 ```
 
-- `base_link` **直接等于设备 IMU 系**。桥接节点把 `device_locate` 位姿原样作为 `map → base_link`，**不做任何外参变换**。
+- 桥接节点把 `device_locate` 位姿原样发布为 `map → imu_link`，再发布静态外参 `imu_link → base_link`。`base_link` 的旋转外参固定（手持扫描仪时 X 朝前、Y 朝左、Z 朝上），平移默认 0，装到载体上按安装位置改平移。
 - 世界系命名为 **`map`**：设备输出是 SLAM + 可重定位的全局位姿（绑地图、有重定位跳变），语义上是 `map`（REP-105）而非 `odom`。
-- 话题：`/lixel/odom`（`nav_msgs/Odometry`，`frame=map`，`child=base_link`）+ `/lixel/tf`（`map → base_link`）。
-- 点云 / IMU / 图像的 `frame_id` 均为 `base_link`（都是设备系数据）。
+- 话题：`/odom`（`nav_msgs/Odometry`，`frame=map`，`child=base_link`）+ `/tf`（`map → imu_link`）+ `/tf_static`（`imu_link → base_link`）。
+- 去畸变点云 `/lixel/device_undist_cloud` 的 `frame_id` 为 `imu_link`；`/lixel/imu` 与相机图像的 `frame_id` 为 `sensor_link`。
+- 外参取值、换算、参数名与话题表以 [`ros2/README.md`](../ros2/README.md) 为准，这里不重复。
 
 ### 3.3 如何接到你的载体（关键）
 
@@ -78,7 +79,7 @@ map ──(动态, ~100Hz, 来自 device_locate)──► base_link
 
 ```
 你的载体 TF 树：
-map ──► base_link(设备IMU) ──► your_robot_center(狗心/车体中心)
+map ──► imu_link(设备IMU) ──► your_robot_center(狗心/车体中心)
                 └ 你自己标定并发布这层静态 TF
 ```
 
@@ -86,8 +87,10 @@ map ──► base_link(设备IMU) ──► your_robot_center(狗心/车体中�
 ```bash
 # 参数：x y z qx qy qz qw parent child
 ros2 run tf2_ros static_transform_publisher \
-  <x> <y> <z> <qx> <qy> <qz> <qw> base_link your_robot_center
+  <x> <y> <z> <qx> <qy> <qz> <qw> imu_link your_robot_center
 ```
+> 上面是不使用桥接节点外参时的做法：桥接的 `base_link` 已带外参（见 3.2），要让 `/odom` 直接输出载体中心位姿，改 `ros2/config/default_params.yaml` 的 `lidar_to_base_*` 平移即可。
+
 其中 `<x y z ...>` 是"设备 IMU 点 → 你的载体中心"的安装外参，由你在自己的载体上标定。
 
 > **为什么这样设计**：设备是通用模组，可能装在任意载体上；把安装外参放在设备/SDK 里会绑死某一种载体。交给集成方，才能通用且无歧义。
@@ -98,12 +101,12 @@ ros2 run tf2_ros static_transform_publisher \
 
 | 项 | 约定 |
 |----|------|
-| 世界系 frame | `map`（可通过 `map_frame` 参数改） |
-| 设备基座 frame | `base_link`（= 设备 IMU 系，可通过 `base_frame` 参数改） |
+| 世界系 frame | `map`（可通过 `odom_frame` 参数改） |
+| 设备 IMU frame | `imu_link`（SDK 直出，`lidar_frame` 参数）；ROS 直出的 ODOM 坐标系为 `base_link`（`base_frame` 参数） |
 | 坐标轴 | 右手系，x 前 / y 左 / z 上（REP-103） |
 | 单位 | m / rad / s / m·s⁻¹ / rad·s⁻¹（SI） |
 | 姿态表达 | 单位四元数（`w,x,y,z`），避免欧拉角万向锁 |
-| TF 父子 | `map → base_link`（两层）；载体层由集成方在 `base_link` 下追加 |
+| TF 父子 | `map → imu_link → base_link`；载体层由集成方按需追加 |
 | 载体变换归属 | **集成方负责**，SDK/设备不提供 |
 
 ---
@@ -117,7 +120,7 @@ ros2 run tf2_ros static_transform_publisher \
 | **ROS REP-103 / REP-105** | 右手系 x前/y左/z上；`map`(全局无漂移可跳变) / `odom`(连续会漂移) / `base_link`(固连基座)；父子链 `map→odom→base_link` |
 | **Slamtec Aurora** | 位姿默认 SE3（`pose_se3_t` = 平移 + 四元数），并提供欧拉角版但文档警告万向锁；输出设备自身位姿，载体集成由使用方处理 |
 | **Manifold Odin1** | ROS 驱动发布 `odom`/`map` 与 TF；里程计在 odom 系、SLAM 点云在 odom 系，需要 map 系时用 TF 转换 |
-| **本项目 lixel_sdk** | 输出设备（IMU）系；ROS 桥接 `map → base_link`；载体变换由集成方叠加 |
+| **本项目 lixel_sdk** | 输出设备（IMU）系；ROS 桥接 `map → imu_link → base_link`（外参可配）；载体变换由集成方叠加 |
 
 > 上表信息来自公开文档/公开驱动仓库，未实测，为概括转述。
 

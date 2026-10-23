@@ -2,24 +2,52 @@ sdk_bridge_node:
   ros__parameters:
     # 设备连接
     device_ip: "192.168.123.103"
-    device_port: 7448          # modeling_app 端口（1.0.0 起，SDK 只连此单端点）
+    # SDK 1.0.0 的 modeling_app 协议在 7448（XG_DEFAULT_PORT）。
+    # 7447 是 0.3.x 的旧端口，设备上两个端口都在 LISTEN，所以 TCP
+    # 能连通、但握不上手，表现为 connect_timeout_ms 到点超时。
+    # 官方 demo 都不暴露端口参数、走默认 7448，因此只有本节点会踩到。
+    device_port: 7448
     connect_timeout_ms: 5000
 
-    # 坐标系名称（map → base_link 两层；base_link 即设备 IMU 系）
-    map_frame: "map"
+    # 坐标系名称（坐标系定义见 README「坐标系」一节，以本文件为准）
+    # 世界坐标系：SDK 的世界系
+    odom_frame: "map"
+    # ODOM 坐标系（ROS 直出）：/odom 输出的就是它的位姿
     base_frame: "base_link"
+    # 雷达坐标系：/lixel/imu 与三路相机图像的 frame_id
+    sensor_frame: "sensor_link"
+    # IMU 坐标系（SDK 直出）：SDK 位姿的参考点。参数键叫 lidar_frame 是历史命名，
+    # 指的就是 IMU 坐标系，不是雷达坐标系。
+    lidar_frame: "imu_link"
+
+    # IMU 坐标系 -> ODOM 坐标系的外参（imu_link -> base_link 静态 TF），节点原样发布，
+    # 不做取逆/取反。含义是“base_link 在 imu_link 中的位姿”。
+    #
+    # 旋转：固定的轴系重定义，换安装位置也不用改。转完后手持扫描仪时 base_link 的
+    # X 朝前、Y 朝左、Z 朝上。对应关系：
+    #   base X = IMU -z,  base Y = IMU +x,  base Z = IMU -y
+    lidar_to_base_qx: 0.5
+    lidar_to_base_qy: 0.5
+    lidar_to_base_qz: -0.5
+    lidar_to_base_qw: 0.5
+    # 平移（米）：默认 0，ODOM 原点就在扫描仪原点（IMU 点）。注意这三个值是按 IMU 轴向
+    # 写的，不是按 ODOM 轴向。设 ODOM 原点要放在扫描仪原点的
+    # 前方 dx、左方 dy、上方 dz 处（按手持时 X 前 / Y 左 / Z 上量），则填
+    #   lidar_to_base_x = dy,  lidar_to_base_y = -dz,  lidar_to_base_z = -dx
+    # 例：A2 机器狗上原点放在狗身中心（扫描仪后方 0.344 m、下方 0.239 m、右方 0.004 m），
+    # 即 dx=-0.343928, dy=-0.004250, dz=-0.238663，填 (-0.004250, 0.238663, 0.343928)。
+    lidar_to_base_x: 0.0
+    lidar_to_base_y: 0.0
+    lidar_to_base_z: 0.0
 
     # 话题名称
-    odom_topic: "/lixel/odom"
-    tf_topic: "/lixel/tf"
-    cloud_topic: "/lixel/cloud_points"
+    odom_topic: "/odom"
+    tf_topic: "/tf"
     imu_topic: "/lixel/imu"
-    raw_cloud_topic: "/lixel/raw_cloud"
+    # 设备（IMU）系 Locate 去畸变点云，frame_id = lidar_frame（imu_link）。建图阶段该 key 无数据
+    device_undist_cloud_topic: "/lixel/device_undist_cloud"
     image_left_topic: "/lixel/camera/left/compressed"
     image_center_topic: "/lixel/camera/center/compressed"
     image_right_topic: "/lixel/camera/right/compressed"
     diagnostics_topic: "/lixel/diagnostics"
 
-    # 说明：SDK 订阅 device_locate/reloc_device_cloud，位姿/点云本身即设备（IMU）系，
-    # base_link 直接等于设备 IMU 基准，桥接不做任何外参变换。
-    # 载体（狗/车等）到设备的安装变换，由集成方在 base_link 之下自行发布 TF。

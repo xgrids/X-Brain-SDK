@@ -2,33 +2,78 @@
  * @file   all_features_demo.cpp
  * @brief  综合功能演示：逐一验证 SDK 全部暴露能力
  *
- * 用法：./all_features_demo <设备IP> [订阅秒数, 默认15]
+ * 用法：./all_features_demo <设备IP> [订阅秒=15] [X=0] [Y=0] [Z=0]
+ *   ./all_features_demo 192.168.123.103
+ *   ./all_features_demo 192.168.123.103 15 1 1 0.45
+ *   X/Y/Z 单位 m，世界/地图系，默认 0 0 0（地图原点），与 pose_demo 一致；
+ *   朝向固定为单位四元数 (w=1,x=0,y=0,z=0)。-h / --help 打印用法。
  *
  * 流程：
  *   1. 连接设备
- *   2. 查询设备状态（getDeviceInfo）
+ *   2. 查询设备状态（getDeviceInfo）与设备时间（getDeviceTime，只读）
  *   3. 查询相机标定（getCameraCalib × 4）
  *   4. 查询 IMU 标定（getImuCalib）
  *   5. 查询雷达标定（getLidarCalib）
  *   6. 查询工程数据路径（getDataPath）
  *   7. 查询录制状态（queryRecordStatus）
  *   8. 启动录制（startRecord + 轮询确认）
- *   9. 订阅全部数据流（Pose/Cloud/IMU/RawCloud/Image/ErrCode）
- *  10. 等待 N 秒，统计各数据流帧数
- *  11. 设置定位初始位姿（setLocInitPose）
+ *   9. 订阅全部数据流（Pose/IMU/DeviceUndistCloud/Image/ErrCode）
+ *  10. 设置定位初始位姿（setLocInitPose，同时启动 Locate）
+ *  11. 等待 N 秒，统计各数据流帧数
  *  12. 取消全部订阅
  *  13. 停止录制（stopRecord + 轮询确认）
  *  14. 查询工程数据路径（录制后）
  *  15. 断开连接
  *
  * 每个步骤打印结果，方便在真机上快速确认所有功能是否正常。
+ *
+ * 前置条件：
+ *   - 设备已开机、应用已起来、状态为 Idle（先用 device_info_demo 确认连得上）。
+ *   - 设备上有可用的重定位地图，且 [X] [Y] [Z] 与设备当前实际位置大致相符。
+ *     默认 0 0 0 在本机地图上重定位可能失败（位姿 0 帧属预期）；想要位姿数据，
+ *     请传设备实际所在附近的坐标（本机实测 1 1 0.45 可成功）。
+ *
+ * 调用顺序与每步为什么：
+ *   - 第 8 步 startRecord 到 Recording：数据流依赖录制状态，Locate 在录制启动时完成初始化。
+ *   - 第 9 步先订阅、第 10 步再 setLocInitPose：设备做 setInitPose + startLocateAlgo，
+ *     Locate 启动后才发布位姿和去畸变点云，先订阅才不丢首帧。
+ *   - 第 11 步等数据：此时位姿与去畸变点云计数才有意义。
+ *   - 第 13 步 stopRecord 并等回 Idle。
+ *
+ * 预期输出与实测数字（注入有效位置 1 1 0.45 时；数字随固件版本变化，仅供参考）：
+ *   - IMU 约 199.9 Hz；三路图像各约 10 Hz（实测 10 Hz，以设备配置为准）；
+ *   - 重定位成功后位姿约 100 Hz，去畸变点云约 9.7 Hz（每帧 19.0k 点，
+ *     范围 17.1k~19.3k），注入后 5.6~6.9 s 重定位成功（实测 5.64/6.02/6.26/6.85 s）；
+ *   - 注入 0 0 0 时本机重定位失败：位姿 0 帧，去畸变点云仅有失败前后到达的少量缓存帧。
+ *   - errCode 只统计帧数，是否有帧取决于设备端发布，本次板端验证未覆盖该项。
+ *   - 设备时钟偏差为区间，宽度等于往返时延（本机实测 0.9~1.6 ms）。
+ *   - 雷达标定 type 在本机为空（设备缺 lidar.yaml），calibrated=1。
+ *   - 从雷达待机起 startRecord 到 Recording 约 17.5~18.6 s，新进程约 7.5~8.5 s。
+ *
+ * 失败现象与处理：
+ *   - 第 8 步未进入 Recording：后续订阅无数据，先查设备状态再重跑。
+ *   - 第 10 步 Rejected：定位未初始化 / 无地图 / 四元数非法；Timeout：命令可能已送达，
+ *     不要立刻重复注入。
+ *   - 位姿或去畸变点云 0 帧：Locate 未启动或重定位未成功（见 reloc_demo）。
+ *
+ * 副作用：
+ *   - 会 startRecord，每次运行在设备上生成一个录制工程（本机实测 87~103 MB/次）。
+ *   - 第 13 步 stopRecord 之后设备应用会退出并由 systemd 重启，约 10~20 s 内设备
+ *     不可用。下一次运行请先用 device_info_demo 确认连得上且状态为 Idle；
+ *     重启期间下发的 startRecord 会被排队，收尾的 stopRecord 在非录制态是空操作。
+ *   - 本示例只做查询、startRecord / stopRecord、订阅和 setLocInitPose，
+ *     不改网络、不上传地图。
+ *
+ * 线程模型：回调在 Zenoh RX 线程触发，回调内不得阻塞；本示例回调只做计数和限频打印。
  */
 
 #include "xg/robot_sdk.h"
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <thread>
@@ -61,9 +106,8 @@ private:
 // 简易计数器
 struct DataCounters {
     std::atomic<int> pose{0};
-    std::atomic<int> cloud{0};
     std::atomic<int> imu{0};
-    std::atomic<int> rawCloud{0};
+    std::atomic<int> undistCloud{0};
     std::atomic<int> imageLeft{0};
     std::atomic<int> imageCenter{0};
     std::atomic<int> imageRight{0};
@@ -96,19 +140,49 @@ void printSeparator(const char* title) {
     std::printf("\n========== %s ==========\n", title);
 }
 
+/** 严格解析浮点参数：整串必须是有限数，否则返回 false */
+bool parseFloatArg(const char* text, float* out) {
+    char* end = nullptr;
+    const float v = std::strtof(text, &end);
+    if (end == text || *end != '\0' || !std::isfinite(v)) {
+        return false;
+    }
+    *out = v;
+    return true;
+}
+
+void printUsage(const char* prog) {
+    std::printf("用法: %s <设备IP> [订阅秒=15] [X=0] [Y=0] [Z=0]\n", prog);
+    std::printf("  X/Y/Z: 定位初值位置, 单位 m, 世界/地图系, 默认 0 0 0\n");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc < 2) {
-        std::printf("用法: %s <设备IP> [订阅秒数, 默认15]\n", argv[0]);
+    if (argc >= 2 && (std::strcmp(argv[1], "-h") == 0 ||
+                      std::strcmp(argv[1], "--help") == 0)) {
+        printUsage(argv[0]);
+        return 0;
+    }
+    if (argc < 2 || argc > 6) {
+        printUsage(argv[0]);
         return 1;
     }
     const std::string deviceIp = argv[1];
     const int subscribeSec = (argc >= 3) ? std::atoi(argv[2]) : 15;
+    float posX = 0.0f, posY = 0.0f, posZ = 0.0f;
+    if ((argc >= 4 && !parseFloatArg(argv[3], &posX)) ||
+        (argc >= 5 && !parseFloatArg(argv[4], &posY)) ||
+        (argc >= 6 && !parseFloatArg(argv[5], &posZ))) {
+        std::printf("参数错误: X/Y/Z 必须是数字 (单位 m)\n");
+        printUsage(argv[0]);
+        return 1;
+    }
 
     std::printf("=== XGRIDS Robot SDK 全功能演示 (v%s) ===\n",
                 xg::sdkVersion().c_str());
-    std::printf("设备: %s, 订阅时长: %d 秒\n\n", deviceIp.c_str(), subscribeSec);
+    std::printf("设备: %s, 订阅时长: %d 秒, 初值 pos=(%.3f, %.3f, %.3f)\n\n",
+                deviceIp.c_str(), subscribeSec, posX, posY, posZ);
 
     // ================================================================
     // 1. 连接设备
@@ -129,7 +203,7 @@ int main(int argc, char** argv) {
     // ================================================================
     // 2. 查询设备状态
     // ================================================================
-    printSeparator("2. 设备状态 (getDeviceInfo)");
+    printSeparator("2. 设备状态与设备时间 (getDeviceInfo / getDeviceTime)");
     {
         xg::Device::DeviceInfo info;
         auto rc = dev->getDeviceInfo(&info);
@@ -145,6 +219,22 @@ int main(int argc, char** argv) {
                         info.memTotalKb > 0 ? 100.0 * info.memUsedKb / info.memTotalKb : 0.0);
             std::printf("  RTK: state=%d, 卫星数=%d\n", info.rtkState, info.satelliteNum);
             std::printf("  建图状态码: %d\n", info.modelingState);
+        }
+        // 设备时间（只读）。偏差只能得到区间，宽度等于往返时延；该区间只适用于取自
+        // 设备系统时钟的数据（图像、深度图），IMU / 位姿 / 点云见 api_reference_v2.md §0.8。
+        xg::Device::DeviceTime devTime;
+        auto trc = dev->getDeviceTime(&devTime);
+        std::printf("  设备时间 result: %s\n",
+                    xg::toString(static_cast<xg::Error>(trc)));
+        if (trc == xg::Error::Ok) {
+            std::printf("  device_epoch_us = %lld (UTC%+.2f h)\n",
+                        (long long)devTime.deviceEpochUs,
+                        devTime.utcOffsetSec / 3600.0);
+            std::printf("  设备时钟 - 本机时钟 ∈ [%+.3f, %+.3f] s, 区间宽度 = 往返时延 %.3f ms\n",
+                        devTime.offsetLowerUs() * 1e-6,
+                        devTime.offsetUpperUs() * 1e-6, devTime.rttUs * 1e-3);
+        } else if (trc == xg::Error::Protocol) {
+            std::printf("  (设备固件不支持时间查询, 或应答无法解析)\n");
         }
     }
 
@@ -267,7 +357,7 @@ int main(int argc, char** argv) {
     };
 
     // 每类数据一个秒级节流器，订阅期间每秒打印一组实际内容
-    static SecondThrottle thrPose, thrCloud, thrImu, thrRawCloud;
+    static SecondThrottle thrPose, thrImu, thrUndistCloud;
     static SecondThrottle thrImgL, thrImgC, thrImgR, thrErr;
 
     sub("subscribePose", dev->subscribePose([&cnt](const xg::Pose& p) {
@@ -282,13 +372,6 @@ int main(int argc, char** argv) {
         }
     }));
 
-    sub("subscribeCloud", dev->subscribeCloud([&cnt](const xg::CloudFrame& f) {
-        cnt.cloud.fetch_add(1);
-        if (thrCloud.tick()) {
-            std::printf("    [cloud] t=%.3f points=%zu seq=%u\n",
-                        f.timestampSec, f.count, f.seq);
-        }
-    }));
 
     sub("subscribeImu", dev->subscribeImu([&cnt](const xg::Device::Imu& imu) {
         cnt.imu.fetch_add(1);
@@ -300,10 +383,11 @@ int main(int argc, char** argv) {
         }
     }));
 
-    sub("subscribeRawCloud", dev->subscribeRawCloud([&cnt](const xg::CloudFrame& f) {
-        cnt.rawCloud.fetch_add(1);
-        if (thrRawCloud.tick()) {
-            std::printf("    [rawcloud] t=%.3f points=%zu seq=%u\n",
+    sub("subscribeDeviceUndistCloud",
+        dev->subscribeDeviceUndistCloud([&cnt](const xg::CloudFrame& f) {
+        cnt.undistCloud.fetch_add(1);
+        if (thrUndistCloud.tick()) {
+            std::printf("    [undist cloud] t=%.3f points=%zu seq=%u\n",
                         f.timestampSec, f.count, f.seq);
         }
     }));
@@ -348,41 +432,56 @@ int main(int argc, char** argv) {
         }));
 
     // ================================================================
-    // 10. 等待数据
+    // 10. 设置定位初始位姿
     // ================================================================
-    printSeparator("10. 等待数据");
-    std::printf("  收集 %d 秒 (每类数据每秒打印一组)...\n", subscribeSec);
-    std::this_thread::sleep_for(std::chrono::seconds(subscribeSec));
-
-    std::printf("\n  --- 数据统计 ---\n");
-    std::printf("  pose:         %d 帧 (%.1f Hz)\n",
-                cnt.pose.load(), (float)cnt.pose.load() / subscribeSec);
-    std::printf("  cloud:        %d 帧\n", cnt.cloud.load());
-    std::printf("  imu:          %d 帧 (%.1f Hz)\n",
-                cnt.imu.load(), (float)cnt.imu.load() / subscribeSec);
-    std::printf("  rawCloud:     %d 帧 (%.1f Hz)\n",
-                cnt.rawCloud.load(), (float)cnt.rawCloud.load() / subscribeSec);
-    std::printf("  imageLeft:    %d 帧\n", cnt.imageLeft.load());
-    std::printf("  imageCenter:  %d 帧\n", cnt.imageCenter.load());
-    std::printf("  imageRight:   %d 帧\n", cnt.imageRight.load());
-    std::printf("  errCode:      %d 帧\n", cnt.errCode.load());
-
-    // ================================================================
-    // 11. 设置定位初始位姿
-    // ================================================================
-    printSeparator("11. 设置定位初始位姿 (setLocInitPose)");
+    printSeparator("10. 设置定位初始位姿 (setLocInitPose)");
+    // setLocInitPose 同时启动设备端 Locate, 之后才有位姿和 Locate 去畸变点云。
+    // 放在订阅之后、等数据之前: 先订阅才不丢首帧, 第 11 步的位姿 / 去畸变点云
+    // 计数才有意义。注入命令行给定的 X/Y/Z (默认地图原点 0 0 0, 单位 m,
+    // 世界/地图系) + 单位四元数; 应传设备当前在地图上的位置附近。
     {
         xg::Device::InitPose pose;
         pose.timestampSec = 0.0;
-        pose.posX = 0.0f;
-        pose.posY = 0.0f;
-        pose.posZ = 0.0f;
+        pose.posX = posX;
+        pose.posY = posY;
+        pose.posZ = posZ;
         pose.quatW = 1.0f;
         pose.quatX = 0.0f;
         pose.quatY = 0.0f;
         pose.quatZ = 0.0f;
         auto rc = dev->setLocInitPose(pose);
         std::printf("  result: %s\n", xg::toString(rc));
+        if (rc == xg::Error::Ok) {
+            std::printf("  设备已接受初值 (仅表示已收下, 不代表重定位完成).\n");
+        } else if (rc == xg::Error::Rejected) {
+            std::printf("  设备拒绝 (定位未初始化 / 无地图 / 四元数非法), "
+                        "位姿与去畸变点云将为 0 帧.\n");
+        } else if (rc == xg::Error::Timeout) {
+            std::printf("  超时, 命令可能已送达, 以第 11 步的计数为准.\n");
+        }
+    }
+
+    // ================================================================
+    // 11. 等待数据
+    // ================================================================
+    printSeparator("11. 等待数据");
+    std::printf("  收集 %d 秒 (每类数据每秒打印一组)...\n", subscribeSec);
+    std::this_thread::sleep_for(std::chrono::seconds(subscribeSec));
+
+    std::printf("\n  --- 数据统计 ---\n");
+    std::printf("  pose:         %d 帧 (%.1f Hz)\n",
+                cnt.pose.load(), (float)cnt.pose.load() / subscribeSec);
+    std::printf("  imu:            %d 帧 (%.1f Hz)\n",
+                cnt.imu.load(), (float)cnt.imu.load() / subscribeSec);
+    std::printf("  undistCloud: %d 帧 (%.1f Hz)\n", cnt.undistCloud.load(),
+                (float)cnt.undistCloud.load() / subscribeSec);
+    std::printf("  imageLeft:    %d 帧\n", cnt.imageLeft.load());
+    std::printf("  imageCenter:  %d 帧\n", cnt.imageCenter.load());
+    std::printf("  imageRight:   %d 帧\n", cnt.imageRight.load());
+    std::printf("  errCode:      %d 帧\n", cnt.errCode.load());
+    if (cnt.pose.load() == 0 || cnt.undistCloud.load() == 0) {
+        std::printf("  提示: 位姿或去畸变点云 0 帧。原因: Locate 未启动或重定位未成功 "
+                    "(注入失败 / 初值与实际位置相差过大 / 无地图), 见 reloc_demo.\n");
     }
 
     // ================================================================
@@ -390,9 +489,8 @@ int main(int argc, char** argv) {
     // ================================================================
     printSeparator("12. 取消全部订阅");
     dev->unsubscribePose();
-    dev->unsubscribeCloud();
     dev->unsubscribeImu();
-    dev->unsubscribeRawCloud();
+    dev->unsubscribeDeviceUndistCloud();
     dev->unsubscribeImage(xg::Device::CameraId::Left);
     dev->unsubscribeImage(xg::Device::CameraId::Center);
     dev->unsubscribeImage(xg::Device::CameraId::Right);

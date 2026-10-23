@@ -71,11 +71,13 @@ History:
 
 #include "xg/robot_sdk_c.h"
 
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <functional>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace xg {
@@ -165,8 +167,9 @@ inline const char* toString(RecordState state) {
 }
 
 /**
- * @brief  取 SDK 版本号
- * @return 形如 "1.0.0" 的字符串
+ * @brief  取 SDK 版本号（运行时库的版本）
+ * @return "MAJOR.MINOR.PATCH" 形式的字符串，详见 xg_sdk_version() 与
+ *         XG_SDK_VERSION_STRING
  */
 inline std::string sdkVersion() {
     return std::string(xg_sdk_version());
@@ -177,7 +180,15 @@ struct CloudFrame {
     const xg_point_t* points{nullptr}; /**< 点数组，回调期间有效 */
     std::size_t count{0};              /**< 点数量 */
     double timestampSec{0.0};          /**< 时间戳（秒） */
-    std::uint32_t seq{0};              /**< 帧序号 */
+    std::uint32_t seq{0};              /**< SDK 本地帧序号（自订阅起递增），不是设备帧号 */
+};
+
+/** 原始点云帧（C++ 视角，设备(IMU)系，未去畸变，未降采样） */
+struct RawCloudFrame {
+    const xg_raw_point_t* points{nullptr}; /**< 点数组，回调期间有效 */
+    std::size_t count{0};                  /**< 点数量 */
+    double timestampSec{0.0};              /**< 帧内最早点的采样时刻（雷达自身时钟的 Unix epoch 秒，不保证等于设备系统时钟） */
+    std::uint32_t seq{0};                  /**< 设备端雷达 frame_id */
 };
 
 /** 位姿（C++ 视角） */
@@ -239,9 +250,8 @@ public:
 
     ~Device() {
         xg_unsubscribe_pose(m_handle);
-        xg_unsubscribe_cloud(m_handle);
         xg_unsubscribe_imu(m_handle);
-        xg_unsubscribe_raw_cloud(m_handle);
+        xg_unsubscribe_device_undist_cloud(m_handle);
         xg_unsubscribe_image(m_handle, XG_CAMERA_LEFT);
         xg_unsubscribe_image(m_handle, XG_CAMERA_CENTER);
         xg_unsubscribe_image(m_handle, XG_CAMERA_RIGHT);
@@ -309,23 +319,6 @@ public:
         return static_cast<Error>(rc);
     }
 
-    /**
-     * @brief  订阅点云数据
-     * @param  callback 回调，在 SDK 内部线程触发，须尽快返回
-     * @return Error::Ok 成功；Error::Rejected 已有活跃订阅
-     */
-    Error subscribeCloud(std::function<void(const CloudFrame&)> callback) {
-        m_cloudCb = std::move(callback);
-        return static_cast<Error>(
-            xg_subscribe_cloud(m_handle, &Device::cloudCbBridge, this));
-    }
-
-    /** 取消点云订阅 */
-    Error unsubscribeCloud() {
-        auto rc = static_cast<Error>(xg_unsubscribe_cloud(m_handle));
-        m_cloudCb = nullptr;
-        return rc;
-    }
 
     /**
      * @brief  订阅位姿数据
@@ -371,20 +364,61 @@ public:
     }
 
     /**
-     * @brief  订阅原始点云数据
+     * @brief  订阅设备(IMU)系 Locate 去畸变点云（key: device_undist_cloud）
      * @param  callback 回调，在 SDK 内部线程触发，须尽快返回
-     * @return Error::Ok 成功；Error::Rejected 已有活跃订阅
+     * @return Error::Ok 成功；Error::Rejected 已有活跃订阅；
+     *         Error::Internal 订阅声明失败
+     * @note   数据语义、线程与内存规则见 xg_subscribe_device_undist_cloud。
+     *         CloudFrame::points 仅回调期间有效。CloudFrame::seq 是 SDK 本地计数，
+     *         点云丢帧用相邻帧 timestampSec 的间隔判断。
      */
-    Error subscribeRawCloud(std::function<void(const CloudFrame&)> callback) {
-        m_rawCloudCb = std::move(callback);
-        return static_cast<Error>(
-            xg_subscribe_raw_cloud(m_handle, &Device::rawCloudCbBridge, this));
+    Error subscribeDeviceUndistCloud(
+        std::function<void(const CloudFrame&)> callback) {
+        m_deviceUndistCloudCb = std::move(callback);
+        return static_cast<Error>(xg_subscribe_device_undist_cloud(
+            m_handle, &Device::deviceUndistCloudCbBridge, this));
     }
 
-    /** 取消原始点云订阅 */
-    Error unsubscribeRawCloud() {
-        auto rc = static_cast<Error>(xg_unsubscribe_raw_cloud(m_handle));
-        m_rawCloudCb = nullptr;
+    /** 取消设备(IMU)系 Locate 去畸变点云订阅（幂等） */
+    Error unsubscribeDeviceUndistCloud() {
+        auto rc =
+            static_cast<Error>(xg_unsubscribe_device_undist_cloud(m_handle));
+        m_deviceUndistCloudCb = nullptr;
+        return rc;
+    }
+
+    /**
+     * @brief  订阅设备(IMU)系原始雷达点云（key: device_raw_cloud）
+     * @param  callback 回调，在 Zenoh 会话接收线程触发，须尽快返回
+     * @return Error::Ok 成功；Error::InvalidArg 回调为空；
+     *         Error::Rejected 已有活跃订阅；Error::Internal 订阅声明失败
+     * @note   数据语义（RoboSense 全量点、未去畸变、IMU 系、逐点时间偏移）、
+     *         无数据的情况（含设备未处于扫描状态）、
+     *         线程与内存规则见 xg_subscribe_device_raw_cloud。
+     *         RawCloudFrame::points 仅回调期间有效。
+     */
+    Error subscribeDeviceRawCloud(
+        std::function<void(const RawCloudFrame&)> callback) {
+        if (!callback) {
+            return Error::InvalidArg;
+        }
+        // 已订阅时不覆盖回调：接收线程可能正在读取旧回调
+        if (m_deviceRawCloudCb) {
+            return Error::Rejected;
+        }
+        m_deviceRawCloudCb = std::move(callback);
+        auto rc = static_cast<Error>(xg_subscribe_device_raw_cloud(
+            m_handle, &Device::deviceRawCloudCbBridge, this));
+        if (rc != Error::Ok) {
+            m_deviceRawCloudCb = nullptr;
+        }
+        return rc;
+    }
+
+    /** 取消设备(IMU)系原始点云订阅（幂等） */
+    Error unsubscribeDeviceRawCloud() {
+        auto rc = static_cast<Error>(xg_unsubscribe_device_raw_cloud(m_handle));
+        m_deviceRawCloudCb = nullptr;
         return rc;
     }
 
@@ -409,7 +443,7 @@ public:
      * @param  cameraId 相机标识
      * @param  callback 回调，在 SDK 内部线程触发，须尽快返回
      * @return Error::Ok 成功；Error::Rejected 该相机已有活跃订阅
-     * @note   回调频率取决于设备端 JPEG 编码配置（默认 2fps）。
+     * @note   回调频率取决于设备端 JPEG 编码配置（帧率以设备配置为准，实测 10 Hz）。
      */
     Error subscribeImage(CameraId cameraId,
                          std::function<void(const ImageFrame&)> callback) {
@@ -434,6 +468,50 @@ public:
             xg_unsubscribe_image(m_handle,
                                  static_cast<xg_camera_id_t>(cameraId)));
         m_imageCb[idx] = nullptr;
+        return rc;
+    }
+
+    /** 深度图帧（C++ 视角，AI 推理产出的度量深度，单位米） */
+    struct DepthFrame {
+        CameraId cameraId{CameraId::Left};
+        double timestampSec{0.0};
+        uint32_t width{0};
+        uint32_t height{0};
+        const float* depthData{nullptr}; /**< 行优先深度数组(米), 回调期间有效 */
+        std::size_t depthSize{0};        /**< depthData 字节数 */
+        std::uint32_t seq{0};
+    };
+
+    /**
+     * @brief  订阅相机深度图（AI 推理产出，仅中间相机有效）
+     * @param  cameraId 相机标识
+     * @param  callback 回调，在 SDK 内部线程触发，须尽快返回
+     * @return Error::Ok 成功；Error::Rejected 该相机已有活跃订阅
+     * @note   回调中 depthData 指针仅在回调执行期间有效。
+     *         设备端默认配置 lixel_t1xb.camera_center.ai.fps 为 0，此时设备不发布
+     *         depth/center，订阅仍返回 Ok；详见 xg_subscribe_depth。
+     */
+    Error subscribeDepth(CameraId cameraId,
+                        std::function<void(const DepthFrame&)> callback) {
+        int idx = static_cast<int>(cameraId);
+        if (idx < 0 || idx > 2) {
+            return Error::InvalidArg;
+        }
+        m_depthCb[idx] = std::move(callback);
+        return static_cast<Error>(
+            xg_subscribe_depth(m_handle, static_cast<xg_camera_id_t>(cameraId),
+                               &Device::depthCbBridge, this));
+    }
+
+    /** 取消相机深度图订阅 */
+    Error unsubscribeDepth(CameraId cameraId) {
+        int idx = static_cast<int>(cameraId);
+        if (idx < 0 || idx > 2) {
+            return Error::InvalidArg;
+        }
+        auto rc = static_cast<Error>(xg_unsubscribe_depth(
+            m_handle, static_cast<xg_camera_id_t>(cameraId)));
+        m_depthCb[idx] = nullptr;
         return rc;
     }
 
@@ -590,6 +668,53 @@ public:
     }
 
     // ================================================================
+    // 设备时间查询（只读）
+    // ================================================================
+    /**
+     * 设备系统时钟快照及本机往返时刻。各字段含义、量纲与偏差区间见
+     * xg_device_time_t 与 api_reference_v2.md §0.8。
+     */
+    struct DeviceTime {
+        std::int64_t deviceEpochUs{0};   /**< 设备系统时钟，Unix epoch 微秒 */
+        std::int32_t utcOffsetSec{0};    /**< 设备本地时区相对 UTC 的偏移（秒，含夏令时），仅用于显示 */
+        std::int64_t hostSendEpochUs{0}; /**< 本机发出查询时的 system_clock，Unix epoch 微秒 */
+        std::int64_t hostRecvEpochUs{0}; /**< 本机收到应答时的 system_clock，Unix epoch 微秒 */
+        std::int64_t rttUs{0};           /**< 本机 steady_clock 测得的往返时延（微秒） */
+
+        /** 偏差下界：offset = 设备时钟 - 本机时钟 >= 该值 */
+        std::int64_t offsetLowerUs() const { return deviceEpochUs - hostRecvEpochUs; }
+        /** 偏差上界：offset = 设备时钟 - 本机时钟 <= 该值 */
+        std::int64_t offsetUpperUs() const { return deviceEpochUs - hostSendEpochUs; }
+        /** 区间中点，仅作粗略估计；真实偏差只保证落在 [下界, 上界] 内 */
+        std::int64_t offsetMidUs() const { return (offsetLowerUs() + offsetUpperUs()) / 2; }
+    };
+
+    /**
+     * @brief  查询设备系统时间（只读）
+     * @param  out 输出，不可为空
+     * @return Error::Ok 成功；Error::InvalidArg out 为空；Error::Timeout 未应答；
+     *         Error::Protocol 应答无法解析，或设备固件不支持本查询
+     * @note   语义、偏差区间与禁止用法见 xg_get_device_time。
+     */
+    Error getDeviceTime(DeviceTime* out) {
+        if (out == nullptr) { return Error::InvalidArg; }
+        xg_device_time_t cOut;
+        std::memset(&cOut, 0, sizeof(cOut));
+        cOut.struct_size = sizeof(cOut);
+        auto rc = static_cast<Error>(xg_get_device_time(m_handle, &cOut));
+        if (rc != Error::Ok) {
+            *out = DeviceTime();  // 失败时清零，与 C 接口的承诺一致
+            return rc;
+        }
+        out->deviceEpochUs = cOut.device_epoch_us;
+        out->utcOffsetSec = cOut.utc_offset_s;
+        out->hostSendEpochUs = cOut.host_send_epoch_us;
+        out->hostRecvEpochUs = cOut.host_recv_epoch_us;
+        out->rttUs = cOut.rtt_us;
+        return Error::Ok;
+    }
+
+    // ================================================================
     // 定位初始位姿设置
     // ================================================================
 
@@ -601,10 +726,14 @@ public:
     };
 
     /**
-     * @brief  设置定位初始位姿（用于重定位）
+     * @brief  设置定位初始位姿，并启动设备端 Locate 算法
      * @param  pose 初始位姿参数
-     * @return Error::Ok 设备已接受
-     * @note   当设备需要在已有地图上重新定位时，提供初始位姿估计帮助收敛。
+     * @return Error::Ok 设备已收下初值且 Locate 算法已启动；
+     *         Error::Rejected 设备拒绝（如四元数模长不合法、定位尚未初始化）
+     * @note   设备端 Locate 的时序是：录制启动时完成初始化 -> 本接口喂入初值并启动算法。
+     *         设备进入 Recording 时初始化已完成。本接口是启动 Locate 的必经步骤：
+     *         调用前设备不发布位姿（subscribePose）和 Locate 去畸变点云
+     *         （subscribeDeviceUndistCloud）。Ok 不代表重定位完成。
      */
     Error setLocInitPose(const InitPose& pose) {
         xg_init_pose_t cPose;
@@ -639,6 +768,28 @@ public:
         if (rc != Error::Ok) { return rc; }
         *path = cOut.path;
         return Error::Ok;
+    }
+
+    // ================================================================
+    // 设备网络配置
+    // ================================================================
+
+    /**
+     * @brief  修改设备对外网口的 IP 与网段，需随后 confirmNetwork，否则自动回滚
+     * @param  gateway         nullptr 保持现有网关，"" 删除默认路由，其他为新网关
+     * @param  confirmTimeoutS 确认窗口（秒），0 为默认值，否则范围 [10, 120]
+     * @return Error::Ok 设备已接受（不代表已生效）；其余见 xg_set_device_network
+     * @note   成功后只应销毁本 Device，确认请使用重新打开的 Device。
+     */
+    Error setNetwork(const std::string& ip, int prefixLen,
+                     const char* gateway = nullptr, int confirmTimeoutS = 0) {
+        return static_cast<Error>(xg_set_device_network(
+            m_handle, ip.c_str(), prefixLen, gateway, confirmTimeoutS));
+    }
+
+    /** 确认网络配置变更，取消自动回滚（幂等） */
+    Error confirmNetwork() {
+        return static_cast<Error>(xg_confirm_device_network(m_handle));
     }
 
     // ================================================================
@@ -802,17 +953,6 @@ private:
         out->message.assign(cStatus.message, len);
     }
 
-    static void cloudCbBridge(const xg_cloud_frame_t* frame, void* ud) {
-        auto* self = static_cast<Device*>(ud);
-        if (self->m_cloudCb && frame != nullptr) {
-            CloudFrame cf;
-            cf.points = frame->points;
-            cf.count = frame->count;
-            cf.timestampSec = frame->timestamp_sec;
-            cf.seq = frame->seq;
-            self->m_cloudCb(cf);
-        }
-    }
 
     static void poseCbBridge(const xg_pose_t* pose, void* ud) {
         auto* self = static_cast<Device*>(ud);
@@ -853,15 +993,29 @@ private:
         }
     }
 
-    static void rawCloudCbBridge(const xg_cloud_frame_t* frame, void* ud) {
+    static void deviceUndistCloudCbBridge(const xg_cloud_frame_t* frame,
+                                             void* ud) {
         auto* self = static_cast<Device*>(ud);
-        if (self->m_rawCloudCb && frame != nullptr) {
+        if (self->m_deviceUndistCloudCb && frame != nullptr) {
             CloudFrame cf;
             cf.points = frame->points;
             cf.count = frame->count;
             cf.timestampSec = frame->timestamp_sec;
             cf.seq = frame->seq;
-            self->m_rawCloudCb(cf);
+            self->m_deviceUndistCloudCb(cf);
+        }
+    }
+
+    static void deviceRawCloudCbBridge(const xg_raw_cloud_frame_t* frame,
+                                       void* ud) {
+        auto* self = static_cast<Device*>(ud);
+        if (self->m_deviceRawCloudCb && frame != nullptr) {
+            RawCloudFrame rf;
+            rf.points = frame->points;
+            rf.count = frame->count;
+            rf.timestampSec = frame->timestamp_sec;
+            rf.seq = frame->seq;
+            self->m_deviceRawCloudCb(rf);
         }
     }
 
@@ -883,6 +1037,26 @@ private:
         self->m_imageCb[idx](img);
     }
 
+    static void depthCbBridge(const xg_depth_frame_t* frame, void* ud) {
+        auto* self = static_cast<Device*>(ud);
+        if (frame == nullptr) {
+            return;
+        }
+        int idx = static_cast<int>(frame->camera_id);
+        if (idx < 0 || idx > 2 || !self->m_depthCb[idx]) {
+            return;
+        }
+        DepthFrame df;
+        df.cameraId = static_cast<CameraId>(frame->camera_id);
+        df.timestampSec = frame->timestamp_sec;
+        df.width = frame->width;
+        df.height = frame->height;
+        df.depthData = frame->depth_data;
+        df.depthSize = frame->depth_size;
+        df.seq = frame->seq;
+        self->m_depthCb[idx](df);
+    }
+
     static void errCodeCbBridge(const xg_err_code_frame_t* frame, void* ud) {
         auto* self = static_cast<Device*>(ud);
         if (!self->m_errCodeCb || frame == nullptr || frame->entries == nullptr) {
@@ -901,11 +1075,12 @@ private:
 
 private:
     xg_device_t* m_handle{nullptr};
-    std::function<void(const CloudFrame&)> m_cloudCb;
     std::function<void(const Pose&)> m_poseCb;
     std::function<void(const Imu&)> m_imuCb;
-    std::function<void(const CloudFrame&)> m_rawCloudCb;
+    std::function<void(const CloudFrame&)> m_deviceUndistCloudCb;
+    std::function<void(const RawCloudFrame&)> m_deviceRawCloudCb;
     std::function<void(const ImageFrame&)> m_imageCb[3];
+    std::function<void(const DepthFrame&)> m_depthCb[3];
     std::function<void(const ErrCodeFrame&)> m_errCodeCb;
     std::function<void(float)> m_mapProgressCb;
 };

@@ -1,6 +1,59 @@
+/******************************************************************************
+This file is part of XGRIDS Robot SDK.
+Project: lixel_sdk
+Author : XGRIDS Embedded Software Team
+******************************************************************************/
+
+/**
+ * @file   device_info_demo.cpp
+ * @brief  XGRIDS Robot SDK 示例：连接设备并只读查询状态、录制状态、时间与标定
+ *
+ * 全程只读：不 startRecord、不订阅、不改设备任何配置。也是其他示例的"设备就绪"
+ * 探针：能连上并打印出"录制状态: idle"，才可以起会 startRecord 的示例。
+ *
+ * 前置条件：设备已开机，主机能到达设备 IP（USB 网卡默认 192.168.55.1）。
+ *
+ * 调用顺序与每步为什么：
+ *   1. Device::open 连接，失败直接退出码 1。
+ *   2. getDeviceInfo：电池、存储、内存、RTK。
+ *   3. queryRecordStatus：确认设备是否待机（Idle）。stopRecord 之后设备应用
+ *      会退出并由 systemd 重启，约 10~20 s 内连不上或查询失败，等它恢复到 Idle 再起
+ *      下一个示例。
+ *   4. getDeviceTime：设备时钟与本机时钟的偏差区间。
+ *   5. getCameraCalib × 4、getImuCalib、getLidarCalib：标定信息。
+ *
+ * 运行：
+ *   ./device_info_demo <设备IP>
+ *   ./device_info_demo 192.168.55.1
+ *
+ * 预期输出与实测数字（数字随固件版本变化，仅供参考）：
+ *   - 第一行 "已连接 <IP> (SDK 1.1.0)"；整个运行约 0.1 s。
+ *   - 时钟偏差形如 "设备时钟 - 本机时钟 ∈ [+133.989, +133.989] s，区间宽度 = 往返
+ *     时延 0.893 ms"：区间下界、上界由往返时延给出，真实偏差落在区间内，区间宽度
+ *     等于往返时延（本机实测 0.9~1.6 ms）；偏差本身取决于两台机器的时钟，
+ *     本机实测设备比主机快约 134 s，且随时间缓慢漂移（约 1 ms/min）。
+ *     该偏差只适用于取自设备系统时钟的数据（图像、深度图），IMU / 位姿 / 点云
+ *     不适用，见 docs/api_reference_v2.md §0.8。
+ *   - 雷达标定 "type=" 在本机为空（设备缺 /mnt/system/factory-data/config/lidar.yaml），
+ *     calibrated=1；相机 camera_3 在本机为 0x0 且 calibrated=0。
+ *
+ * 失败现象与处理：
+ *   - "连接失败": 检查网线 / 网段 / 设备应用是否已起来（刚 stopRecord 后需等 10~20 s）。
+ *   - 单项 "查询失败" 只打印，不影响退出码；退出码 0 只表示连接成功。
+ *   - 设备时间 "无法获取": 应答无法解析，或设备固件不支持时间查询。
+ *
+ * 副作用：无录制副作用（不 startRecord / stopRecord）。副作用仅有一点：getLidarCalib
+ * 每次调用会让设备日志多出 6 行 lidar.yaml 不存在的 <E> 记录（本机缺该文件），
+ * 属于设备端噪声，不是故障。
+ *
+ * 线程模型：同步调用，无回调。
+ */
+
 #include "xg/robot_sdk.h"
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <string>
 
 int main(int argc, char** argv) {
@@ -33,6 +86,50 @@ int main(int argc, char** argv) {
         std::printf("  RTK: state=%d, sat=%d\n", info.rtkState, info.satelliteNum);
     } else {
         std::printf("  查询失败\n");
+    }
+
+    // 录制状态（只读）：判断设备是否待机, 供其他示例起跑前确认
+    std::printf("\n=== 录制状态 ===\n");
+    xg::RecordStatus recStatus;
+    const xg::Error recRc = device->queryRecordStatus(&recStatus);
+    if (recRc == xg::Error::Ok) {
+        std::printf("  录制状态: %s (raw=%d)%s\n", xg::toString(recStatus.state),
+                    recStatus.rawCode, recStatus.warning ? " [WARNING]" : "");
+    } else {
+        std::printf("  查询失败: %s\n", xg::toString(recRc));
+    }
+
+    // 设备时间（只读）。设备应答的是设备系统时钟；偏差只能得到一个区间，
+    // 区间宽度等于往返时延。该偏差只适用于取自设备系统时钟的数据（图像、深度图），
+    // IMU / 位姿 / 点云取自 MCU 或雷达时钟，见 docs/api_reference_v2.md §0.8。
+    std::printf("\n=== 设备时间 ===\n");
+    xg::Device::DeviceTime devTime;
+    const xg::Error timeRc = device->getDeviceTime(&devTime);
+    if (timeRc == xg::Error::Ok) {
+        const std::int64_t localUs =
+            devTime.deviceEpochUs +
+            static_cast<std::int64_t>(devTime.utcOffsetSec) * 1000000;
+        const std::time_t localSec = static_cast<std::time_t>(localUs / 1000000);
+        std::tm tmLocal;
+        gmtime_r(&localSec, &tmLocal);  // 已加时区偏移，按 UTC 展开即为设备本地时间
+        const int offAbsMin =
+            (devTime.utcOffsetSec < 0 ? -devTime.utcOffsetSec
+                                      : devTime.utcOffsetSec) / 60;
+        std::printf("  设备本地时间: %04d-%02d-%02d %02d:%02d:%02d.%06d (UTC%c%d:%02d)\n",
+                    tmLocal.tm_year + 1900, tmLocal.tm_mon + 1, tmLocal.tm_mday,
+                    tmLocal.tm_hour, tmLocal.tm_min, tmLocal.tm_sec,
+                    static_cast<int>(localUs % 1000000),
+                    devTime.utcOffsetSec < 0 ? '-' : '+', offAbsMin / 60,
+                    offAbsMin % 60);
+        std::printf("  device_epoch_us = %lld\n",
+                    static_cast<long long>(devTime.deviceEpochUs));
+        std::printf("  设备时钟 - 本机时钟 ∈ [%+.3f, %+.3f] s，区间宽度 = 往返时延 %.3f ms\n",
+                    devTime.offsetLowerUs() * 1e-6, devTime.offsetUpperUs() * 1e-6,
+                    devTime.rttUs * 1e-3);
+    } else if (timeRc == xg::Error::Protocol) {
+        std::printf("  无法获取：应答无法解析，或设备固件不支持时间查询\n");
+    } else {
+        std::printf("  查询失败: %s\n", xg::toString(timeRc));
     }
 
     // 相机标定

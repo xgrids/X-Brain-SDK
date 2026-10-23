@@ -1,7 +1,7 @@
-# lixel_sdk 1.0.0 接口说明书
+# lixel_sdk 1.1.0 接口说明书
 
 **文档等级：** 对外 ICD（接口控制文件）  
-**适用版本：** `XG_SDK_VERSION_*` = 1.0.0，`xg_sdk_version()` = `"1.0.0"`  
+**适用版本：** `XG_SDK_VERSION_*` = 1.1.0，`xg_sdk_version()` = `"1.1.0"`  
 **ABI 真源：** [`include/xg/robot_sdk_c.h`](../include/xg/robot_sdk_c.h)  
 **C++ 封装：** [`include/xg/robot_sdk.h`](../include/xg/robot_sdk.h)（header-only，全部 inline）
 
@@ -32,9 +32,9 @@
 
 ### 0.2 `struct_size`
 
-C 侧由**调用方分配**的结构（`xg_options_t`、`xg_record_status_t`、各 `*_calib_t`、`xg_device_info_t`、`xg_init_pose_t`、`xg_data_path_t`）必须先置 `struct_size = sizeof(...)`，否则 `InvalidArg`。
+C 侧由**调用方分配**的结构（`xg_options_t`、`xg_record_status_t`、各 `*_calib_t`、`xg_device_info_t`、`xg_device_time_t`、`xg_init_pose_t`、`xg_data_path_t`）必须先置 `struct_size = sizeof(...)`，否则 `InvalidArg`。
 
-由 **SDK 填写**的回调结构（`xg_pose_t`、`xg_cloud_frame_t`、`xg_imu_t`、`xg_image_frame_t`、`xg_err_code_frame_t`）的 `struct_size` 由 SDK 写入，调用方只读。
+由 **SDK 填写**的回调结构（`xg_pose_t`、`xg_cloud_frame_t`、`xg_raw_cloud_frame_t`、`xg_imu_t`、`xg_image_frame_t`、`xg_err_code_frame_t`）的 `struct_size` 由 SDK 写入，调用方只读。
 
 当前实现要求 **精确相等**，不是「大于等于即可」。C++ 封装已代填。
 
@@ -48,7 +48,7 @@ C 侧由**调用方分配**的结构（`xg_options_t`、`xg_record_status_t`、�
 
 ### 0.4 连接拓扑
 
-`Options.port`（默认 7448）**直接是 modeling_app 的端口**。SDK 只连 modeling_app 一个端点：数据面（`device_locate`/`reloc_device_cloud`/`raw_imu`/`raw_pointcloud`/`camera/*`/`err_code`）与命令面（`robot_cmd` Get）都在 modeling_app 的同一 session。详见 README「网络要求」。
+`Options.port`（默认 7448）**直接是 modeling_app 的端口**。SDK 只连 modeling_app 一个端点：数据面（`device_locate`/`raw_imu`/`device_undist_cloud`/`device_raw_cloud`/`camera/*`/`depth/*`/`err_code`）与命令面（`robot_cmd` Get）都在 modeling_app 的同一 session。详见 README「网络要求」。
 
 ### 0.5 C++ 与 C 对照约定
 
@@ -101,6 +101,67 @@ C 侧由**调用方分配**的结构（`xg_options_t`、`xg_record_status_t`、�
   - `CloudFrame`、`ImageFrame` 的 `points` / `jpegData` **仍是指向 SDK 缓冲的裸指针**，规则同 C，须回调内拷贝；
   - `ErrCodeFrame::entries` 是**已拷贝好的 `std::vector`**（桥接层已从 C 缓冲拷出），但该 vector 随回调参数对象销毁，**跨回调持有仍需再拷一份**。
 
+### 0.8 时间戳时基与换算
+
+本节是时间戳语义的唯一详写处，其余章节只链接到这里。
+
+**文档性质与依据：** 设备端取时钟的来源依据固件源码静态阅读得出，**未上板实测**。标「推断」的是由调用关系得出、没有直接看到赋值的结论，标「未查到」的是读不到实现（预编译算法库、相机驱动库、MCU 固件）。
+
+**1. 数值换算（SDK 侧，确定）**
+
+SDK 不对任何时间戳加减偏移，只做量纲换算：
+
+| 来源 | 线上类型 | SDK 换算 | 得到 |
+|------|----------|----------|------|
+| 位姿、点云、原始点云、IMU（protobuf `header.stamp`） | int64，微秒 | `÷ 1e6` | `timestamp_sec`（double，秒） |
+| 图像、深度图（数据体前 8 字节，小端） | uint64，微秒 | `× 1e-6` | `timestamp_sec`（double，秒） |
+| 错误码条目 | uint64，微秒 | 不换算 | `entries[i].timestamp`（微秒） |
+
+所有数值都按「自 1970-01-01 00:00:00 UTC 起的 Unix epoch」解读，与 `xg_device_time_t.device_epoch_us`（int64，微秒）**同量纲**。还原为线上微秒用 `llround(timestamp_sec × 1e6)`。epoch 秒值在 double 里的分辨率约 0.24 µs；在 1.7e15 到 1.8e15 µs 区间随机取 200 万个整数，`÷1e6` 与 `×1e-6` 两种换算再用 `llround` 还原，与原值均零差异。
+
+**2. 同量纲不等于同一个时钟（设备侧，按平台而异）**
+
+设备端对每路数据**不做发布层偏移**，但各路 epoch 值取自不同的时钟：
+
+| 数据 | SDK 字段 | 时钟来源 | 能否直接与 `device_epoch_us` 相减 |
+|------|----------|----------|------------------------------------|
+| 图像 `camera/*` | `ImageFrame.timestampSec` | 设备系统时钟（`CLOCK_REALTIME`）：取帧时把驱动缓冲时间映射为 epoch，再叠加设备配置的固定补偿（当前配置值在 0 到 9.21 ms 之间，随平台不同）。取帧口径（帧起 / 帧止 / 曝光中点）未查到 | 可以，误差为固定补偿加口径不确定 |
+| 深度图 `depth/center` | `DepthFrame.timestampSec` | 沿用中间相机图像的时间戳（推断） | 同图像 |
+| 错误码 `err_code` | `entries[i].timestamp` | **同一条消息内混合**：建模 / 系统类取设备系统时钟；SLAM 类取算法状态时间（传感器时基）；定位库类时基未查到 | 无法逐条区分，不可用于对时 |
+| IMU `raw_imu` | `Imu.timestampSec` | 随平台：使用 MCU 串口 IMU 的平台取 **MCU 时钟**（原样使用 MCU 打戳）；使用雷达内置 IMU 的平台取**雷达时钟再减固定 9.5 ms** | 不保证 |
+| 位姿 `device_locate` | `Pose.timestampSec` | 定位算法输入的 IMU / 点云时基，算法库内部赋值未查到（推断同上一行） | 不保证 |
+| 去畸变点云 `device_undist_cloud` | `CloudFrame.timestampSec` | Locate 输出帧时基（`UndistortCloudType.timestamp`，时基未验证）；对应帧首、帧尾还是中间未查到 | 不保证 |
+| 原始点云 `device_raw_cloud` | `RawCloudFrame.timestampSec` | **雷达自身时钟**（RoboSense 数据包头里的 UTC 时间），帧内最早点 | 不保证 |
+
+设备端唯一的粗对齐保证：RoboSense 雷达帧在进入处理前会与系统时间比较，雷达帧时间不在「系统时间之前 0 到 10 s」内的帧被丢弃，这个比较发生在雷达回调入口，所以进入处理的雷达帧，其帧时间在该时刻的设备系统时间之前 0 到 10 s 内；帧到达 SDK 时还要再加上设备端处理、队列和网络的时延，上界不再是 10 s。**这不是对时精度。**
+
+MCU 平台上，MCU 时钟由设备在启动、每次开始扫描时用系统时钟授时一次，授时之间 MCU 自走。雷达平台上雷达时钟与系统时钟是否由 PTP 对齐，在设备端代码里未查到配置，也没有对外暴露的同步状态位。
+
+**3. 把设备时钟换到本机时钟**
+
+设备采样 `device_epoch_us` 的时刻必然落在本机 `[host_send_epoch_us, host_recv_epoch_us]` 之内，所以
+
+```
+offset = 设备系统时钟 - 本机时钟
+device_epoch_us - host_recv_epoch_us  <=  offset  <=  device_epoch_us - host_send_epoch_us
+```
+
+区间宽度等于 `host_recv_epoch_us - host_send_epoch_us`，比 `rtt_us` 多出几次时钟读取的开销（微秒量级），**不依赖去程与回程对称**。`DeviceTime` 提供 `offsetLowerUs()` / `offsetUpperUs()` / `offsetMidUs()`，中点只是粗略估计。
+
+对取自**设备系统时钟**的数据（图像、深度图），本机时刻为：
+
+```
+t_host_us = timestamp_us - offset        // offset 取区间内的值，不确定度 = 区间宽度
+```
+
+对 IMU、位姿、点云等**不保证取自设备系统时钟**的数据，`offset` 对它们不成立，SDK 与设备都不提供它们相对设备系统时钟的偏差。需要把这些数据与本机或其他传感器严格对齐时，须在设备侧做时间同步（MCU 的 PPS 或雷达 PTP），本接口不能替代。
+
+**4. 使用限制**
+
+- 本机 `system_clock` 在查询期间被调整（NTP 跳变等）时，区间无意义。
+- 设备系统时钟在运行中会被调整：手机 / App 设置时间、MCU RTC 回写、配置了 PPS 的设备在开始扫描时启动 chrony 校准。调整之后的 `device_epoch_us` 与之前收到的图像时间戳不在同一个连续时间轴上，**每次要换算前重新查询**，并建议在开始录制之后再查。
+- SDK 只提供只读查询，不提供设置设备时间的能力。
+
 ---
 
 # 第一板块 · 数据结构
@@ -116,8 +177,9 @@ C 侧由**调用方分配**的结构（`xg_options_t`、`xg_record_status_t`、�
 | `xg_record_status_t` / `RecordStatus` | 调用方分配型 | `queryRecordStatus` | [2.3](#23-recordstatus--xg_record_status_t) |
 | `xg_options_t` / `Options` | 调用方分配型 | `open` | [2.4](#24-options--xg_options_t) |
 | `xg_pose_t` / `Pose` | SDK 填充型 | `subscribePose` | [3.1](#31-位姿-pose) |
-| `xg_point_t` | SDK 填充型（点元素） | `subscribeCloud` / `subscribeRawCloud` | [3.2](#32-单点-point) |
-| `xg_cloud_frame_t` / `CloudFrame` | SDK 填充型 | `subscribeCloud` / `subscribeRawCloud` | [3.3](#33-点云帧-cloudframe) |
+| `xg_point_t` | SDK 填充型（点元素） | `subscribeDeviceUndistCloud` | [3.2](#32-单点-point) |
+| `xg_cloud_frame_t` / `CloudFrame` | SDK 填充型 | `subscribeDeviceUndistCloud` | [3.3](#33-点云帧-cloudframe) |
+| `xg_raw_point_t` / `xg_raw_cloud_frame_t` / `RawCloudFrame` | SDK 填充型（点元素 + 帧） | `subscribeDeviceRawCloud` | [3.3.1](#331-原始点云-rawcloudframe) |
 | `xg_imu_t` / `Imu` | SDK 填充型 | `subscribeImu` | [3.4](#34-惯导-imu) |
 | `xg_camera_id_t` / `CameraId` | 枚举 | `subscribeImage` | [3.5](#35-相机标识-cameraid) |
 | `xg_image_frame_t` / `ImageFrame` | SDK 填充型 | `subscribeImage` | [3.6](#36-图像帧-imageframe) |
@@ -127,6 +189,7 @@ C 侧由**调用方分配**的结构（`xg_options_t`、`xg_record_status_t`、�
 | `xg_imu_calib_t` / `ImuCalib` | 调用方分配型 | `getImuCalib` | [4.2](#42-imu-标定-imucalib) |
 | `xg_lidar_calib_t` / `LidarCalib` | 调用方分配型 | `getLidarCalib` | [4.3](#43-雷达标定-lidarcalib) |
 | `xg_device_info_t` / `DeviceInfo` | 调用方分配型 | `getDeviceInfo` | [4.4](#44-设备状态-deviceinfo) |
+| `xg_device_time_t` / `DeviceTime` | 调用方分配型 | `getDeviceTime` | [4.4.1](#441-设备时间-devicetime) |
 | `xg_init_pose_t` / `InitPose` | 调用方分配型（入参） | `setLocInitPose` | [4.5](#45-定位初值-initpose) |
 | `xg_data_path_t` | 调用方分配型 | `getDataPath` | [4.6](#46-工程路径-xg_data_path_t) |
 
@@ -302,6 +365,8 @@ struct Options {
 
 本章结构体均属「SDK 填充型」（[0.7.2](#072-sdk-填充型订阅回调)），由订阅回调填充。**订阅怎么调、回调指针能活多久、如何持久化，见 [§7 订阅接口](#7-订阅接口)。** 本章只描述数据形态与坐标系语义。
 
+> **时间戳：** 本章各结构的 `timestamp_sec` 都是 Unix epoch 秒，但**各路取自不同的时钟**（设备系统时钟、MCU 时钟、雷达时钟），换算关系与能否与 `getDeviceTime` 对比见 [§0.8](#08-时间戳时基与换算)，本章不重复。
+
 ### 3.1 位姿 Pose
 
 > **坐标系约定（重要）：** SDK 对外输出的位姿以**设备（IMU）系**为基准（R_W_I，原点在设备 IMU 点）。设备是唯一基准，**载体（狗/车等）的安装变换由集成方自行计算**（与竞品一致）。设备内部另有一套 Body/载体系位姿仅供设备导航使用，不经 SDK。坐标系详见 [coordinate_frames_and_tf.md](coordinate_frames_and_tf.md)。
@@ -406,9 +471,13 @@ typedef struct {
 
 ### 3.3 点云帧 CloudFrame
 
-> **坐标系约定（重要）：** reloc 点云与位姿一样，SDK 对外以**设备（IMU）系**为基准。key 为 **`reloc_device_cloud`（IMU 系）**，来源为设备端 `RelocOutType.imu_cloud`。reloc 点云是 NDT 配准产物（~10Hz），非原始雷达扫描。
+> **坐标系约定（重要）：** 点云与位姿一样，SDK 对外以**设备（IMU）系**为基准，桥接与 SDK 均不做外参变换。
 >
-> **注意 reloc 点云是重定位 NDT 配准的产物（约 10 Hz），不是每帧雷达扫描**；每帧原始扫描请用 `subscribeRawCloud`。坐标系详见 [coordinate_frames_and_tf.md](coordinate_frames_and_tf.md)。
+> - 点云只剩一路（见下）。
+> - Locate 去畸变点云 `device_undist_cloud`（1.1 起）：设备端 Locate 输出 `imu_cloud`，设备（IMU）系，点数取决于 Locate 输入点云（当前为驱动层 1/4 降采样；全量输入属 locate-full-cloud-feed，RFC 状态：提案，未实现；未验证）；建图阶段 Locate 未输出时无数据；回调运行在 Zenoh RX 线程，回调内禁止同步文件 IO、`join`、`startLocate`；回调单次耗时上限待定。
+> - `device_reloc_cloud` 与 `subscribeDeviceRelocCloud` 已在 1.1 删除，不双发。
+>
+> 坐标系详见 [coordinate_frames_and_tf.md](coordinate_frames_and_tf.md)。
 
 **C（`robot_sdk_c.h`）**
 ```c
@@ -432,7 +501,7 @@ struct CloudFrame {
 };
 ```
 
-> `CloudFrame` 镜像省去 `struct_size`。reloc 点云与原始点云**共用此结构体**，语义不同（见 [§7.2 点云订阅](#72-点云订阅)）。
+> `CloudFrame` 镜像省去 `struct_size`。只有 `subscribeDeviceUndistCloud`（Locate 去畸变点云，见 [§7.2 点云订阅](#72-点云订阅)）使用此结构体；原始雷达点云使用 [`RawCloudFrame`](#331-原始点云-rawcloudframe)。重定位点云订阅已在 1.1 删除。
 
 **成员说明**
 
@@ -442,7 +511,7 @@ struct CloudFrame {
 | `points` | `points` | `const xg_point_t*` | 指向 `count` 个 `xg_point_t` 的连续数组 |
 | `count` | `count` | size_t | 点数量 |
 | `timestamp_sec` | `timestampSec` | double | 时间戳（秒） |
-| `seq` | `seq` | uint32 | **SDK 本地**序号，自订阅起递增，非设备 seq |
+| `seq` | `seq` | uint32 | **SDK 本地**序号，自订阅起递增，非设备 seq；不能用其跳变发现丢帧，点云丢帧只能用相邻帧 `timestamp_sec` 的间隔判断 |
 
 **布局示意**
 
@@ -451,7 +520,62 @@ frame->points ─► [ point[0] | point[1] | ... | point[count-1] ]
                    └16B┘      └16B┘            每个 = {x,y,z,intensity} float×4
 ```
 
-> 由 `subscribeCloud` / `subscribeRawCloud` 填充。`points` 指针寿命与拷贝方式 → 见 [§7.2 点云订阅](#72-点云订阅)。
+> 由 `subscribeDeviceUndistCloud` 填充。`points` 指针寿命与拷贝方式 → 见 [§7.2 点云订阅](#72-点云订阅)。
+
+### 3.3.1 原始点云 RawCloudFrame
+
+> **与 §3.3 去畸变点云的区别：** 本路是 RoboSense 一次完整扫描的**全部点**，**未降采样、未运动去畸变**；点坐标为设备（IMU）系，只做了静态外参刚体变换（`extrinsic_imu_lidar`，Lidar→IMU，见 `getLidarCalib`）。每个点带 `time_offset_us`，集成方用它配合自己的位姿做去畸变。点类型和帧类型都**不同于** §3.2 / §3.3，不能混用。
+
+**C（`robot_sdk_c.h`）**
+```c
+/** 原始雷达点。固定 24 字节布局，无 struct_size，永不改动 */
+typedef struct {
+    float x, y, z;          /**< 设备(IMU)系，单位 m，线路上四舍五入到 1 mm */
+    float intensity;        /**< 雷达反射强度，无单位 */
+    int32_t time_offset_us;  /**< 相对 timestamp_sec 的偏移 (us)，可为负 */
+    uint16_t ring;          /**< 雷达线束号，超过 65535 时饱和为 65535 */
+    uint16_t reserved;      /**< 保留，集成方须忽略其值 */
+} xg_raw_point_t;
+
+typedef struct {
+    size_t struct_size;            /**< 由 SDK 填写为 sizeof(xg_raw_cloud_frame_t) */
+    const xg_raw_point_t* points;  /**< 回调返回后不可再访问 */
+    size_t count;
+    double timestamp_sec;          /**< 帧内最早点的采样时刻（雷达自身时钟的 Unix epoch 秒，
+                                        不保证等于设备系统时钟，见 §0.8） */
+    uint32_t seq;                  /**< 设备端雷达 frame_id，不是 SDK 本地计数 */
+} xg_raw_cloud_frame_t;
+```
+
+**C++（`robot_sdk.h`）**
+```cpp
+struct RawCloudFrame {
+    const xg_raw_point_t* points{nullptr}; /**< 点数组，回调期间有效 */
+    std::size_t count{0};
+    double timestampSec{0.0};
+    std::uint32_t seq{0};                  /**< 设备端雷达 frame_id */
+};
+```
+
+**字节布局（`xg_raw_point_t`，24 字节）**
+
+| 偏移 | 字段 | 类型 |
+|------|------|------|
+| 0 / 4 / 8 | `x` / `y` / `z` | float |
+| 12 | `intensity` | float |
+| 16 | `time_offset_us` | int32 |
+| 20 | `ring` | uint16 |
+| 22 | `reserved` | uint16 |
+
+**语义要点**
+
+- 点的采样时刻 = `timestamp_sec + time_offset_us × 1e-6`。
+- `seq` 是设备端雷达帧号，可用其跳变发现设备端丢帧（设备端拥塞时 DROP）。与 `CloudFrame.seq`（SDK 本地计数）语义不同。
+- 坐标在设备端四舍五入到毫米后传输，最大误差 0.5 mm。
+- `reserved` 为保留位，集成方须忽略其值；当前实现写 0，预留给逐点标志。
+- `timestamp_sec` 是帧内最早点的采样时刻，帧内各点的 `time_offset_us` 不小于 0 是预期（驱动按首点取帧时间戳，`ts_first_point`，所以最小偏移按设计为 0，未上板实测），契约允许为负。
+- `timestamp_sec` 取自**雷达自身时钟**（RoboSense 数据包头里的 UTC 时间），不保证等于设备系统时钟，不能直接与 `getDeviceTime` 的 `device_epoch_us` 相减；换算关系见 [§0.8](#08-时间戳时基与换算)。
+- 不过滤设备配置里被屏蔽的线束。
 
 ### 3.4 惯导 Imu
 
@@ -841,6 +965,51 @@ struct DeviceInfo {
 
 > 不映射设备 JSON 的 `type/cycle`、`cpu_loads`、`navsat_status`。`modelingState` 不要当 `RecordState` 用；录制状态请用 `queryRecordStatus`。获取语义见 [§9.1 getDeviceInfo](#91-getdeviceinfo--xg_get_device_info)。
 
+### 4.4.1 设备时间 DeviceTime
+
+> 设备系统时钟的只读快照加本机往返时刻。**换算关系、哪些订阅数据取自设备系统时钟，见 [§0.8](#08-时间戳时基与换算)。** 获取语义见 [§9.2 getDeviceTime](#92-getdevicetime--xg_get_device_time)。
+
+**C（`robot_sdk_c.h`）**
+```c
+typedef struct {
+    size_t struct_size;         /**< 必须由调用方填写为 sizeof(xg_device_time_t) */
+    int64_t device_epoch_us;    /**< 设备系统时钟（CLOCK_REALTIME），Unix epoch 微秒 */
+    int32_t utc_offset_s;       /**< 设备本地时区相对 UTC 的偏移（秒，含夏令时），仅用于显示 */
+    int32_t reserved;           /**< 保留，SDK 写 0，集成方须忽略 */
+    int64_t host_send_epoch_us; /**< 本机发出查询时的 system_clock，Unix epoch 微秒 */
+    int64_t host_recv_epoch_us; /**< 本机收到应答时的 system_clock，Unix epoch 微秒 */
+    int64_t rtt_us;             /**< 本机 steady_clock 测得的往返时延（微秒） */
+} xg_device_time_t;
+```
+
+**C++（`robot_sdk.h`）**
+```cpp
+struct DeviceTime {
+    std::int64_t deviceEpochUs{0};
+    std::int32_t utcOffsetSec{0};
+    std::int64_t hostSendEpochUs{0};
+    std::int64_t hostRecvEpochUs{0};
+    std::int64_t rttUs{0};
+    std::int64_t offsetLowerUs() const;  // deviceEpochUs - hostRecvEpochUs
+    std::int64_t offsetUpperUs() const;  // deviceEpochUs - hostSendEpochUs
+    std::int64_t offsetMidUs() const;    // 区间中点，仅粗略估计
+};
+```
+
+**成员说明**
+
+| C 字段 | C++ 字段 | 类型 | 单位 | 含义 |
+|--------|----------|------|------|------|
+| `struct_size` | （封装填写） | size_t | — | 调用前必须 = `sizeof` |
+| `device_epoch_us` | `deviceEpochUs` | int64 | µs | 设备系统时钟，自 1970-01-01 00:00:00 UTC 起；设备在状态查询完成后、序列化应答之前采样 |
+| `utc_offset_s` | `utcOffsetSec` | int32 | s | 设备本地时区相对 UTC 的偏移，含夏令时；范围 -86400 到 86400，超出视为应答非法；`device_epoch_us` 同理，大于 0 且不晚于 3000-01-01 00:00:00 UTC |
+| `reserved` | （无） | int32 | — | 保留，写 0 |
+| `host_send_epoch_us` | `hostSendEpochUs` | int64 | µs | 本机 `system_clock`，查询发出前取 |
+| `host_recv_epoch_us` | `hostRecvEpochUs` | int64 | µs | 本机 `system_clock`，应答收到后取 |
+| `rtt_us` | `rttUs` | int64 | µs | 本机 `steady_clock` 测得，不受 `system_clock` 调整影响 |
+
+字节布局（共 48 字节，无填充）：`struct_size` 偏移 0（8 字节）；`device_epoch_us` 偏移 8；`utc_offset_s` 偏移 16；`reserved` 偏移 20；`host_send_epoch_us` 偏移 24；`host_recv_epoch_us` 偏移 32；`rtt_us` 偏移 40。
+
 ### 4.5 定位初值 InitPose
 
 > 这是重定位**先验**（入参），不是查询结果。写入语义见 [§10.1 setLocInitPose](#101-setlocinitpose--xg_set_loc_init_pose)。
@@ -1041,6 +1210,7 @@ Error getDataPath(std::string* path);
 - 回调在 **SDK 内部线程**（Zenoh 会话线程）触发，**不可阻塞**、不可在回调内再调同一句柄的 SDK 接口。
 - 取消订阅**幂等**：无活跃订阅时也返回 `Ok`；返回后保证不再触发对应回调。
 - 内存所有权总则见 [0.7](#07-内存布局与所有权模型)。
+- **深度图 `depth/center`（`subscribeDepth` / `xg_subscribe_depth`，本说明书尚无完整条目，接口定义以头文件为准）：** 设备端默认配置下不发布此 key（T1XB 配置文件 `modeling_app_t1xb.yaml` 中 `lixel_t1xb.camera_center.ai.fps` 默认为 0），须设备端把该项配置为大于 0 且 AI 模型就绪后才有数据；无数据时订阅仍返回 `Ok`，SDK 无法区分原因。
 
 ### 7.1 位姿订阅
 
@@ -1070,23 +1240,59 @@ Error getDataPath(std::string* path);
 
 ### 7.2 点云订阅
 
-**接口**：点云有两个来源，**共用同一结构体 [`CloudFrame`](#33-点云帧-cloudframe)**，语义不同：
+**接口**：本节只有一路点云，Locate 去畸变点云，使用结构体 [`CloudFrame`](#33-点云帧-cloudframe)（原始雷达点云见 [§7.2.1](#721-原始雷达点云订阅)）：
 
-| 来源 | C++ | C | key（1.0.0） | 说明 |
-|------|-----|---|--------------|------|
-| reloc 点云 | `subscribeCloud(cb)` / `unsubscribeCloud()` | `xg_subscribe_cloud` / `xg_unsubscribe_cloud` | `reloc_device_cloud` | ~10 Hz，重定位配准点云（NDT 产物），设备（IMU）系，**不是每帧雷达扫描** |
-| 原始点云 | `subscribeRawCloud(cb)` / `unsubscribeRawCloud()` | `xg_subscribe_raw_cloud` / `xg_unsubscribe_raw_cloud` | `raw_pointcloud`（不变） | ~10 Hz，去畸变原始帧，未经 SLAM |
+| 来源 | C++ | C | key | 说明 |
+|------|-----|---|-----|------|
+| Locate 去畸变点云 | `subscribeDeviceUndistCloud(cb)` / `unsubscribeDeviceUndistCloud()` | `xg_subscribe_device_undist_cloud` / `xg_unsubscribe_device_undist_cloud` | `device_undist_cloud` | 随 Locate 输出（频率未验证）；Locate 去畸变点云，设备（IMU）系；建图阶段无数据；回调在 Zenoh RX 线程，禁止同步文件 IO、`join`、`startLocate` |
 
-**作用：** 订阅点云流。两个订阅槽独立。
-**点坐标系：** `subscribeCloud` 为设备（IMU）系（1.0.0 起）；`subscribeRawCloud` 为雷达原始系（不变）。
+> **1.1.0 破坏性变更：** 旧接口 `xg_subscribe_cloud` / `xg_subscribe_raw_cloud`（C++ `subscribeCloud` / `subscribeRawCloud`）及旧 key `reloc_device_cloud` / `raw_pointcloud` 已删除，不保留兼容。SDK 1.1.0 必须配套发布新 key 的设备固件；1.1.0 SDK 连接旧固件时订阅返回 `Ok` 但收不到点云，1.0.0 SDK 连接新固件同样收不到点云。
 
-**返回值：** `Ok`；`InvalidArg`；`Rejected`（对应类型已有订阅）；`Internal`。
+**作用：** 订阅 Locate 去畸变点云流。该订阅槽与 [§7.2.1](#721-原始雷达点云订阅) 的原始点云订阅槽独立，互不影响。
+
+**返回值（C）：** `XG_OK`；`XG_ERR_INVALID_ARG`（`dev` 或 `cb` 为空）；`XG_ERR_REJECTED`（本句柄该路点云已有订阅，已有订阅不受影响）；`XG_ERR_INTERNAL`（Zenoh 订阅声明失败）。设备端暂无该 key 数据时订阅同样返回 `XG_OK`，只是暂无回调。C++ 封装始终传入非空桥接回调，因此 C++ 不会返回 `InvalidArg`。
+
+**失败后状态：** C 接口返回非 `XG_OK` 时不登记订阅、不保存回调，修正后可重试。
+
+**取消：** 幂等，无活跃订阅时也返回 `Ok`；`dev` 为空返回 `InvalidArg`；返回后保证不再触发该回调。禁止在该订阅自己的回调内取消。
+
+**线程：** 回调在 SDK 内部线程（Zenoh 会话线程）触发；回调内禁止阻塞、禁止再调同一句柄的 SDK 接口。
 
 **内存与生命周期**
 
 - 属「SDK 填充型」（[0.7.2](#072-sdk-填充型订阅回调)）。`points` 指向 SDK 内部 `thread_local std::vector<xg_point_t>` 的 `data()`。
 - **指针仅回调期内有效；下一帧点云回调会 `resize` 覆盖同一块缓冲。**
 - 要留整帧，回调内深拷贝：`memcpy(dst, frame->points, frame->count * sizeof(xg_point_t))`（即 `count * 16` 字节）。
+- **禁止**对 `points` 调用 `free`/`delete`。
+
+### 7.2.1 原始雷达点云订阅
+
+**接口**
+
+| | C++ | C |
+|---|-----|---|
+| 订阅 | `Error subscribeDeviceRawCloud(std::function<void(const RawCloudFrame&)>)` | `xg_err_t xg_subscribe_device_raw_cloud(xg_device_t*, xg_raw_cloud_cb_t, void*)` |
+| 取消 | `Error unsubscribeDeviceRawCloud()` | `xg_err_t xg_unsubscribe_device_raw_cloud(xg_device_t*)` |
+
+**作用 / key / 频率：** 订阅 RoboSense 的全量、未去畸变点云，设备（IMU）系。key `device_raw_cloud`，~10 Hz。数据结构见 [§3.3.1](#331-原始点云-rawcloudframe)。独立订阅槽，与 §7.2 的 Locate 去畸变点云订阅互不影响。
+
+**返回值（C）：** `XG_OK`；`XG_ERR_INVALID_ARG`（`dev` 或 `cb` 为空）；`XG_ERR_REJECTED`（本句柄已有原始点云订阅，已有订阅不受影响）；`XG_ERR_INTERNAL`（Zenoh 订阅声明失败或内存不足）。
+**返回值（C++）：** `Ok`；`InvalidArg`（回调为空）；`Rejected`（已订阅，C++ 封装不覆盖原回调）；`Internal`。
+
+**设备端发布条件：** 设备端只在存在订阅者（Zenoh 匹配状态）且处于扫描状态时才构造和发布全量帧；订阅者状态无法判断时退回常开发布。订阅后到收到首帧的延迟，由匹配状态传播和下一帧到达共同决定，未测量。
+
+**订阅返回 `Ok` 但收不到帧的情况（SDK 无法区分）：** 设备雷达不是 RoboSense；设备端 `extrinsic_imu_lidar.yaml` 缺失或不是合法刚体变换（设备端丢弃该帧）；设备尚未进入录制/扫描状态。设备端拥塞时按 DROP 丢帧，表现为 `seq` 跳变。
+
+**失败后状态：** C 接口返回非 `XG_OK` 时不登记订阅、不保存回调，修正后可重试。
+
+**取消：** 幂等，无活跃订阅时也返回 `Ok`；`dev` 为空返回 `InvalidArg`；返回后保证不再触发该回调。禁止在该订阅自己的回调内取消或关闭句柄。
+
+**线程：** 回调在 Zenoh 会话接收线程触发，不在调用方线程；回调内禁止阻塞、禁止再调同一句柄的 SDK 接口。阻塞会拖住本进程全部订阅。单帧点数多，回调内请只做拷贝或入队。
+
+**内存与生命周期**
+
+- 属「SDK 填充型」。`points` 指向 SDK 内部 `thread_local std::vector<xg_raw_point_t>` 的 `data()`，**仅回调期内有效，下一帧覆盖同一块缓冲**。
+- 要留整帧，回调内深拷贝：`memcpy(dst, frame->points, frame->count * sizeof(xg_raw_point_t))`（即 `count * 24` 字节）。
 - **禁止**对 `points` 调用 `free`/`delete`。
 
 ### 7.3 IMU 订阅
@@ -1118,7 +1324,7 @@ Error getDataPath(std::string* path);
 
 **作用：** 订阅相机 JPEG 图像流。数据结构见 [§3.6 ImageFrame](#36-图像帧-imageframe)。
 **订阅槽：** **三路相机各占独立订阅槽**（`Left`/`Center`/`Right`）。
-**频率：** 取决于设备端 JPEG 编码配置（设备 yaml `jpeg.fps`，SDK 头注释历史值约 2 fps，以设备配置为准）。
+**频率：** 取决于设备端 JPEG 编码配置（设备 yaml `jpeg.fps`，SDK 头注释历史值约 2 fps，以设备配置为准；板端实测某配置 `jpeg.fps=10` 时为 10.01 Hz）。
 **Zenoh key 映射：** `Left`→`camera/left`、`Center`→`camera/center`、`Right`→`camera/right`。
 
 **返回值：** `Ok`；`InvalidArg`（空 / `cameraId` 越界）；`Rejected`（**该相机**已有订阅）；`Internal`。
@@ -1225,6 +1431,56 @@ Error getDataPath(std::string* path);
 
 `modelingState` 不是五态，不要当 `RecordState` 用；录制请用 `queryRecordStatus`。
 
+### 9.2 `getDeviceTime` / `xg_get_device_time`
+
+**接口**
+
+| | 签名 |
+|---|------|
+| C++ | `Error Device::getDeviceTime(DeviceTime* out)` |
+| C | `xg_err_t xg_get_device_time(xg_device_t* dev, xg_device_time_t* out)` |
+
+**作用：** 只读查询设备系统时钟，并给出它与本机时钟的偏差区间。数据结构见 [§4.4.1](#441-设备时间-devicetime)，**与各订阅时间戳的换算关系见 [§0.8](#08-时间戳时基与换算)**。
+
+**线路复用：** 发送与 [§9.1](#91-getdeviceinfo--xg_get_device_info) 相同的 `getDeviceStatus` 命令，设备在应答 `data` 里追加 `time` 对象：
+
+```json
+{ "method": "getDeviceStatus",
+  "data": { "code": 0, "...": "原有字段不变",
+            "time": { "epoch_us": 1791795901300521, "utc_offset_s": 28800 } } }
+```
+
+**兼容性**
+
+| 组合 | 行为 |
+|------|------|
+| 新 SDK + 新固件 | 正常 |
+| 新 SDK + 旧固件 | 应答里没有 `time`，返回 `Protocol` |
+| 旧 SDK（1.0.0）+ 新固件 | 旧 SDK 只读自己认识的键，多出的 `time` 被忽略，`getDeviceInfo` 不受影响 |
+
+**返回值**
+
+| 返回 | 条件 |
+|------|------|
+| `Ok` | 应答含合法 `data.time`。设备状态查询失败（`data.code != 0`）时设备仍会带回 `time`，此时同样返回 `Ok` |
+| `InvalidArg` | `dev` 或 `out` 为空；`struct_size` 不匹配 |
+| `Timeout` | 无应答（查询超时 3 s，加 0.5 s 余量，调用最长阻塞 3.5 s） |
+| `Protocol` | 应答非 JSON、无 `data`、无 `time`（旧固件）、`epoch_us` 或 `utc_offset_s` 缺失、不是整数或超出 int64 范围、`epoch_us` 小于等于 0 或晚于 3000-01-01 00:00:00 UTC、`utc_offset_s` 超出 ±86400 |
+| `Internal` | SDK 内部异常 |
+
+**线程：** 同步阻塞调用线程，最长 3.5 s；同一句柄不可重入（见 [§0.3](#03-线程与寿命)）。
+
+**内存与寿命：** `out` 由调用方分配并持有，SDK 不保留指针。
+
+**失败后状态：** 除 `struct_size` 不匹配外，返回非 `Ok` 时 `out` 除 `struct_size` 外全部置 0（含 `dev` 为空），不得使用；`struct_size` 不匹配时无法确定 `out` 的大小，`out` 保持原样。C++ 的 `getDeviceTime` 失败时一律把 `DeviceTime` 清零。设备端无任何状态变化。
+
+**禁止用法**
+
+- 不要把 `device_epoch_us` 当作 MCU 时钟或雷达时钟的读数，也不要用它换算 IMU、位姿、点云的时间戳，原因见 [§0.8](#08-时间戳时基与换算)。
+- 本接口只读，SDK 不提供设置设备时间的能力。
+
+**精度：** 偏差只能得到区间 `[device_epoch_us - host_recv_epoch_us, device_epoch_us - host_send_epoch_us]`，宽度等于 `rtt_us`。设备在状态查询完成后才采样时间，所以真实偏差更靠近区间下界（状态查询越慢越明显）；中点仅作粗略估计。区间宽度见 [§0.8](#08-时间戳时基与换算)；往返时延的实际分布未在真机上测量。
+
 ---
 
 ## 10. 定位初值接口
@@ -1238,8 +1494,8 @@ Error getDataPath(std::string* path);
 | C++ | `Error Device::setLocInitPose(const InitPose& pose)` |
 | C | `xg_err_t xg_set_loc_init_pose(xg_device_t* dev, const xg_init_pose_t* pose)` |
 
-**作用：** 向已加载地图的定位库注入世界系位姿先验。
-**前置：** 设备宜已 Recording 且 `startLocate` 已执行；否则设备可能丢弃初值仍回成功。
+**作用：** 向已加载地图的定位库注入世界系位姿先验，并启动设备端 Locate 算法。设备端时序为：录制启动时初始化（`startLocate`，即 `locateInit`）-> 本接口喂入初值（`setInitPose`）并启动算法（`startLocateAlgo`，即 `locateStart`）。这是启动 Locate 的必经步骤：调用前设备不发布 `device_locate`（位姿）和 `device_undist_cloud`。
+**前置：** 设备已 Recording（此时初始化已完成）。未初始化时设备应答 `code=-1`、`reason=start locate failed`，SDK 返回 `Rejected`，初值不会被缓存。同一录制内重复调用：设备回 `code=0` 并跳过重复启动，新初值是否触发重新定位由定位库决定，未测。
 **入参：** [`InitPose` / `xg_init_pose_t`](#45-定位初值-initpose)；C 须 `struct_size`。不发送 `origin`（设备侧写死 0）。
 
 **返回值**
@@ -1249,10 +1505,10 @@ Error getDataPath(std::string* path);
 | `Ok` | 应答 `data.code == 0`（**已收下 JSON**） |
 | `InvalidArg` | 空 / `struct_size` |
 | `Timeout` | 无应答 |
-| `Rejected` | `code != 0`（缺字段、四元数模长 ≤ 0.1、`locate not found` 等） |
+| `Rejected` | `code != 0`（缺字段、四元数模长 ≤ 0.1、`locate not found`、`start locate failed` 等） |
 | `Protocol` | 非 JSON 或无 `data` |
 
-**不是**重定位完成，也**没有**阶段查询。
+`Ok` **不是**重定位完成（只表示初值已收下、算法已启动），也**没有**阶段查询。
 
 ---
 
@@ -1286,7 +1542,16 @@ Error getDataPath(std::string* path);
 |------|------|------|
 | `xg_err_str` / `toString(Error)` | `const char*` | 静态，勿 free；未知码 `"unknown error"` |
 | `xg_record_state_str` / `toString(RecordState)` | `const char*` | 静态 |
-| `xg_sdk_version` / `sdkVersion` | `"1.0.0"` | C++ 为 `std::string` 拷贝 |
+| `xg_sdk_version` / `sdkVersion` | `"1.1.0"` | C++ 为 `std::string` 拷贝 |
+
+**版本宏（`robot_sdk_c.h`）：** `XG_SDK_VERSION_MAJOR` / `MINOR` / `PATCH` 自 0.1.0 起提供；以下两个宏 1.1.0 新增，均由这三个宏派生。
+
+| 宏 | 类型 | 说明 |
+|----|------|------|
+| `XG_SDK_VERSION_STRING` | 字符串字面量，如 `"1.1.0"` | 编译期头文件版本；与运行时 `xg_sdk_version()` 不同即为头文件与库不配套 |
+| `XG_SDK_VERSION_NUMBER` | 整数常量表达式，`MAJOR*10000 + MINOR*100 + PATCH`，如 1.1.0 为 `10100` | 可用于 `#if`，按头文件版本条件编译（如 `#if XG_SDK_VERSION_NUMBER >= 10100`）。只反映编译期头文件，**禁止**用它判断运行时库版本 |
+
+内部辅助宏 `XG_SDK_VERSION_STR_` / `XG_SDK_VERSION_STR_IMPL_` 不属于公开接口，禁止直接使用。
 
 ---
 
@@ -1299,10 +1564,10 @@ Error getDataPath(std::string* path);
 | 数据 | 结构体 | 订阅接口 | C++ 接口 | 引入 | 频率（量级） | 指针寿命 |
 |------|--------|----------|----------|------|--------------|----------|
 | Body 位姿 | [3.1](#31-位姿-pose) | [7.1](#71-位姿订阅) | `subscribePose` | 0.2.0 | ~100 Hz | 结构体按值；无堆指针 |
-| reloc 点云 | [3.3](#33-点云帧-cloudframe) | [7.2](#72-点云订阅) | `subscribeCloud` | 0.2.0 | ~10 Hz | `points` 仅回调内 |
-| 原始点云 | [3.3](#33-点云帧-cloudframe) | [7.2](#72-点云订阅) | `subscribeRawCloud` | 0.3.1* | ~10 Hz | `points` 仅回调内 |
+| Locate 去畸变点云 | [3.3](#33-点云帧-cloudframe) | [7.2](#72-点云订阅) | `subscribeDeviceUndistCloud` | 1.1.0（新增；0.3.1 的 `subscribeRawCloud` 已删除，语义不同：旧接口是 SLAM 去畸变单帧、1/4 降采样，见 [v1.1.0.md](releases/v1.1.0.md) Changed 第 3 条） | 随 Locate 输出（未验证） | `points` 仅回调内 |
+| 原始雷达点云 | [3.3.1](#331-原始点云-rawcloudframe) | [7.2.1](#721-原始雷达点云订阅) | `subscribeDeviceRawCloud` | 1.1.0 | ~10 Hz，仅 RoboSense | `points` 仅回调内 |
 | 原始 IMU | [3.4](#34-惯导-imu) | [7.3](#73-imu-订阅) | `subscribeImu` | 0.3.1* | ~200 Hz | 按值 |
-| JPEG 图像 | [3.6](#36-图像帧-imageframe) | [7.4](#74-图像订阅) | `subscribeImage` | 0.3.1* | ~2 fps（以设备配置为准） | `jpegData` 仅回调内 |
+| JPEG 图像 | [3.6](#36-图像帧-imageframe) | [7.4](#74-图像订阅) | `subscribeImage` | 0.3.1* | 帧率以设备配置为准（实测 10 Hz） | `jpegData` 仅回调内 |
 | 错误码 | [3.7](#37-错误码-errcodeframe) | [7.5](#75-错误码订阅) | `subscribeErrCode` | 0.3.1 | ~10 Hz | C++ 已拷贝 vector |
 
 `*` 头注释写 v0.3.0，仓库随 0.3.1 首次出现。
@@ -1323,4 +1588,10 @@ Error getDataPath(std::string* path);
 | 日期 | 说明 |
 |------|------|
 | 2026-09-03 | 1.0.0 接口说明书：数据结构板块 + 接口板块 + 附录。位姿/reloc 点云为设备（IMU）系（`device_locate` / `reloc_device_cloud`）；`is_local` 为保留字段（恒 0）。 |
+| 2026-09-29 | 点云接口改名（破坏性）：`subscribeCloud` → `subscribeDeviceRelocCloud`（key `device_reloc_cloud`），`subscribeRawCloud` → `subscribeDeviceUndistCloud`（key `device_undist_cloud`）；修正原表述“去畸变原始帧，未经 SLAM / 雷达原始系”：该路是 SLAM 去畸变单帧、设备（IMU）系、1/4 降采样。新增版本宏 `XG_SDK_VERSION_STRING` / `XG_SDK_VERSION_NUMBER`。 |
+| 2026-10-09 | 新增 `subscribeDeviceRawCloud`（key `device_raw_cloud`）：RoboSense 全量、未降采样、未去畸变点云，设备（IMU）系，逐点 `time_offset_us` / `ring`；新类型 `xg_raw_point_t`（24 字节）/ `xg_raw_cloud_frame_t`。纯增量，随 1.1.0 发布。 |
+| 2026-10-12 | 文档版本对齐 1.1.0（标题、适用版本、`xg_sdk_version` 返回值）。新增发布说明 [releases/v1.1.0.md](releases/v1.1.0.md)。本说明书尚无 `xg_subscribe_depth` / `xg_unsubscribe_depth`、`xg_set_device_network` / `xg_confirm_device_network`、地图管理 `xg_upload_map` / `xg_set_active_map` / `xg_list_maps` / `xg_delete_map` 的条目，这些接口的契约以 [`robot_sdk_c.h`](../include/xg/robot_sdk_c.h) 为准。 |
+| 2026-10-12 | 新增只读设备时间查询 `getDeviceTime` / `xg_get_device_time`（[§9.2](#92-getdevicetime--xg_get_device_time)）与数据结构 `xg_device_time_t`（[§4.4.1](#441-设备时间-devicetime)），新增 [§0.8 时间戳时基与换算](#08-时间戳时基与换算)。更正原始点云时间戳「设备时钟」的说法：实际取自雷达自身时钟，不保证等于设备系统时钟。纯增量，随 1.1.0 发布；需要设备固件在 `getDeviceStatus` 应答里带 `time`。 |
+| 2026-10-14 | `device_undist_cloud` 语义变更（locate-full-cloud-feed）：由 SLAM 单帧去畸变变为 Locate 去畸变点云（设备（IMU）系）；key 由 `device_undistort_cloud` 改为 `device_undist_cloud`；删除 `subscribeDeviceRelocCloud` / `xg_subscribe_device_reloc_cloud`（key `device_reloc_cloud`）。回调耗时未验证。 |
+| 2026-10-22 | 补充 §7 开头列表中的深度图数据可用性（默认配置 `ai.fps: 0` 时设备不发布 `depth/center`）；清理已删除重定位点云的残留表述（§3.3、§7.2、§7.2.1、§13）；§3.3 `seq` 说明补充点云丢帧判断方式。纯文档。 |
 
